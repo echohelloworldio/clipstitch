@@ -1131,10 +1131,26 @@ class VideoClipperApp:
         self.pot_server_dir = tk.StringVar(value=DEFAULT_POT_SERVER_DIR)
         self.advanced_visible = tk.BooleanVar(value=False)
 
+        # Export options
+        self.aspect_preset_var = tk.StringVar(value="None (keep original)")
+        self.normalize_audio_var = tk.BooleanVar(value=False)
+        self.crossfade_var = tk.BooleanVar(value=False)
+        self.crossfade_duration_var = tk.StringVar(value="0.5")
+        self.export_webm_var = tk.BooleanVar(value=False)
+        self.export_mp3_var = tk.BooleanVar(value=False)
+        self.thumbnail_var = tk.BooleanVar(value=False)
+        self.thumbnail_time_var = tk.StringVar(value="0:00")
+        self.gif_var = tk.BooleanVar(value=False)
+        self.gif_start_var = tk.StringVar(value="0:00")
+        self.gif_duration_var = tk.StringVar(value="3")
+
         self.is_running = False
         self._pending_final_path = None
         self._pending_work_dir = None
         self._pending_suggested_name = "clip"
+
+        self.queue = []  # list of job dicts
+        self._queue_running = False
 
         self._build_layout()
         self._update_source_mode()
@@ -1305,6 +1321,51 @@ class VideoClipperApp:
         self._build_advanced_contents(self.advanced_frame)
         # not packed yet - toggled on demand
 
+        # --- Export options (collapsible) ---
+        export_toggle_row = ttk.Frame(main, style="TFrame")
+        export_toggle_row.pack(fill="x", pady=(6, 0))
+        self.export_visible = tk.BooleanVar(value=False)
+        self.export_toggle_btn = ttk.Button(
+            export_toggle_row, text="\u25B8  Export options (presets, crossfade, extras)",
+            style="Advanced.TButton", command=self._toggle_export_options,
+        )
+        self.export_toggle_btn.pack(anchor="w")
+
+        self.export_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER,
+                                      highlightthickness=1)
+        self._build_export_contents(self.export_frame)
+        # not packed yet - toggled on demand
+
+        # --- Batch queue ---
+        queue_header_row = ttk.Frame(main, style="TFrame")
+        queue_header_row.pack(fill="x", pady=(16, 4))
+        ttk.Label(queue_header_row, text="Batch queue", style="SectionHeader.TLabel").pack(side="left")
+        ttk.Label(queue_header_row, text="(optional - queue up several jobs to run unattended)",
+                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
+
+        queue_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+        queue_frame.pack(fill="x", pady=(0, 6))
+        self.queue_tree = ttk.Treeview(
+            queue_frame, columns=("source", "status"), show="headings", height=4,
+        )
+        self.queue_tree.heading("source", text="Source")
+        self.queue_tree.heading("status", text="Status")
+        self.queue_tree.column("source", width=420, anchor="w")
+        self.queue_tree.column("status", width=140, anchor="w")
+        self.queue_tree.pack(fill="x", padx=1, pady=1)
+
+        queue_btn_row = ttk.Frame(main, style="TFrame")
+        queue_btn_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(queue_btn_row, text="+ Add current setup to queue", style="Secondary.TButton",
+                   command=self.on_add_to_queue).pack(side="left")
+        ttk.Button(queue_btn_row, text="Remove selected", style="Secondary.TButton",
+                   command=self.on_remove_from_queue).pack(side="left", padx=(6, 0))
+        ttk.Button(queue_btn_row, text="Clear queue", style="Secondary.TButton",
+                   command=self.on_clear_queue).pack(side="left", padx=(6, 0))
+        self.run_queue_button = ttk.Button(queue_btn_row, text="\u25B6  Run Queue", style="Secondary.TButton",
+                                            command=self.on_run_queue)
+        self.run_queue_button.pack(side="right")
+
         # --- Run button + progress ---
         run_row = ttk.Frame(main, style="TFrame")
         run_row.pack(fill="x", pady=(18, 2))
@@ -1405,6 +1466,114 @@ class VideoClipperApp:
     def _run_row_anchor(self):
         # the run_button's parent frame is packed right after advanced - find it
         return self.run_button.master
+
+    def _toggle_export_options(self):
+        visible = not self.export_visible.get()
+        self.export_visible.set(visible)
+        if visible:
+            self.export_toggle_btn.configure(text="\u25BE  Export options (presets, crossfade, extras)")
+            self.export_frame.pack(fill="x", pady=(6, 0), before=self._run_row_anchor())
+        else:
+            self.export_toggle_btn.configure(text="\u25B8  Export options (presets, crossfade, extras)")
+            self.export_frame.pack_forget()
+
+    def _build_export_contents(self, parent):
+        pad = {"padx": 14, "pady": 6}
+
+        # Aspect preset
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", padx=14, pady=(12, 6))
+        ttk.Label(row, text="Aspect / preset", style="Card.TLabel", width=16).pack(side="left")
+        ttk.Combobox(row, textvariable=self.aspect_preset_var, state="readonly", width=28,
+                     values=list(ASPECT_PRESETS.keys())).pack(side="left")
+        ttk.Label(parent, text="Crops+scales for TikTok/Shorts, YouTube, or Instagram. "
+                                "Forces a re-encode.", style="CardMuted.TLabel"
+                  ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        # Normalize audio
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", **pad)
+        ttk.Checkbutton(row, text="Normalize audio loudness (consistent volume across clips)",
+                         variable=self.normalize_audio_var, style="Card.TCheckbutton").pack(side="left")
+
+        # Crossfade
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", **pad)
+        ttk.Checkbutton(row, text="Crossfade between clips instead of a hard cut, duration (s):",
+                         variable=self.crossfade_var, style="Card.TCheckbutton").pack(side="left")
+        ttk.Entry(row, textvariable=self.crossfade_duration_var, width=5).pack(side="left", padx=(6, 0))
+        ttk.Label(parent, text="Only applies when there are 2+ clips; forces a re-encode.",
+                  style="CardMuted.TLabel").pack(anchor="w", padx=14, pady=(0, 8))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=14, pady=4)
+
+        # Side exports
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", **pad)
+        ttk.Checkbutton(row, text="Also export a WebM version", variable=self.export_webm_var,
+                         style="Card.TCheckbutton").pack(side="left")
+        ttk.Checkbutton(row, text="Also export audio-only (MP3)", variable=self.export_mp3_var,
+                         style="Card.TCheckbutton").pack(side="left", padx=(20, 0))
+
+        # Thumbnail
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", **pad)
+        ttk.Checkbutton(row, text="Save a thumbnail at", variable=self.thumbnail_var,
+                         style="Card.TCheckbutton").pack(side="left")
+        ttk.Entry(row, textvariable=self.thumbnail_time_var, width=8).pack(side="left", padx=(6, 4))
+        ttk.Label(row, text="(time within the FINAL clip, e.g. 0:02)",
+                  style="CardMuted.TLabel").pack(side="left")
+
+        # GIF
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill="x", padx=14, pady=(0, 14))
+        ttk.Checkbutton(row, text="Save a GIF starting at", variable=self.gif_var,
+                         style="Card.TCheckbutton").pack(side="left")
+        ttk.Entry(row, textvariable=self.gif_start_var, width=8).pack(side="left", padx=(6, 8))
+        ttk.Label(row, text="for", style="Card.TLabel").pack(side="left")
+        ttk.Entry(row, textvariable=self.gif_duration_var, width=5).pack(side="left", padx=(4, 4))
+        ttk.Label(row, text="seconds (within the FINAL clip)",
+                  style="CardMuted.TLabel").pack(side="left")
+
+    def _gather_export_options(self):
+        """Reads the Export options panel into the dict the pipeline
+        functions expect. Raises ValueError with a friendly message if
+        any of the free-typed fields are invalid."""
+        opts = {}
+        preset_label = self.aspect_preset_var.get()
+        opts["aspect_preset_filter"] = ASPECT_PRESETS.get(preset_label)
+        opts["normalize_audio"] = self.normalize_audio_var.get()
+
+        if self.crossfade_var.get():
+            try:
+                opts["crossfade_duration"] = float(self.crossfade_duration_var.get())
+            except ValueError:
+                raise ValueError("Crossfade duration must be a number (seconds).")
+        else:
+            opts["crossfade_duration"] = None
+
+        opts["export_webm"] = self.export_webm_var.get()
+        opts["export_mp3"] = self.export_mp3_var.get()
+
+        if self.thumbnail_var.get():
+            try:
+                opts["thumbnail_time"] = parse_time(self.thumbnail_time_var.get())
+            except ValueError:
+                raise ValueError("Thumbnail time isn't a valid timestamp (e.g. 0:02).")
+        else:
+            opts["thumbnail_time"] = None
+
+        if self.gif_var.get():
+            try:
+                opts["gif_start"] = parse_time(self.gif_start_var.get())
+                opts["gif_duration"] = float(self.gif_duration_var.get())
+            except ValueError:
+                raise ValueError("GIF start/duration isn't valid (e.g. start 0:01, duration 3).")
+        else:
+            opts["gif_start"] = None
+            opts["gif_duration"] = 3.0
+
+        return opts
 
     # ------------------------------------------------------------------
     # Source mode / drop zone
@@ -1682,6 +1851,12 @@ class VideoClipperApp:
             messagebox.showerror("Invalid timestamps", str(e))
             return
 
+        try:
+            export_options = self._gather_export_options()
+        except ValueError as e:
+            messagebox.showerror("Invalid export options", str(e))
+            return
+
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
@@ -1699,7 +1874,7 @@ class VideoClipperApp:
                     final_path = run_pipeline_from_file(
                         input_path, segments, reencode, log=self.log,
                         progress=self.set_progress, work_dir=work_dir,
-                        keep_clips=keep_clips,
+                        keep_clips=keep_clips, export_options=export_options,
                     )
                     suggested_name = sanitize_filename(
                         os.path.splitext(os.path.basename(input_path))[0] + "_clipped"
@@ -1721,7 +1896,7 @@ class VideoClipperApp:
                         cookies_browser=cookies_browser, cookies_profile=cookies_profile,
                         cookies_file=cookies_file, quality=quality,
                         auto_pot_server=auto_pot_server, pot_server_dir=pot_server_dir,
-                        keep_clips=keep_clips,
+                        keep_clips=keep_clips, export_options=export_options,
                     )
 
                 self._pending_final_path = final_path
@@ -1801,6 +1976,24 @@ class VideoClipperApp:
                 except OSError as e:
                     self.log(f"WARNING: couldn't move individual clips folder: {e}")
 
+        def _move_extra_exports(dest_video_path):
+            base = os.path.splitext(dest_video_path)[0]
+            extras = [
+                ("output.webm", base + ".webm"),
+                ("output.mp3", base + ".mp3"),
+                ("output_thumb.jpg", base + "_thumb.jpg"),
+                ("output.gif", base + ".gif"),
+            ]
+            for src_name, dest_path in extras:
+                src_path = os.path.join(self._pending_work_dir, src_name)
+                if os.path.isfile(src_path):
+                    dest_path = self._avoid_overwrite(dest_path)
+                    try:
+                        shutil.move(src_path, dest_path)
+                        self.log(f"Saved: {dest_path}")
+                    except OSError as e:
+                        self.log(f"WARNING: couldn't move {src_name}: {e}")
+
         def do_save():
             folder = folder_var.get().strip()
             name = sanitize_filename(name_var.get().strip(), fallback="clip")
@@ -1822,6 +2015,7 @@ class VideoClipperApp:
                 return
 
             _move_clips_folder(dest)
+            _move_extra_exports(dest)
             shutil.rmtree(self._pending_work_dir, ignore_errors=True)
             dialog.destroy()
             self._show_success(dest)
@@ -1834,6 +2028,7 @@ class VideoClipperApp:
                 os.makedirs(default_folder, exist_ok=True)
                 shutil.move(final_path, default_dest)
                 _move_clips_folder(default_dest)
+                _move_extra_exports(default_dest)
                 shutil.rmtree(self._pending_work_dir, ignore_errors=True)
                 dialog.destroy()
                 self._show_success(default_dest)
@@ -1896,6 +2091,169 @@ class VideoClipperApp:
                    command=dialog.destroy).pack(side="right")
 
         self.log(f"Saved to: {dest_path}")
+
+    # ------------------------------------------------------------------
+    # Batch queue
+    # ------------------------------------------------------------------
+    def on_add_to_queue(self):
+        mode = self.source_mode.get()
+        timestamps_text = self._get_timestamps_text()
+
+        if mode == "file":
+            input_path = self.input_path.get().strip()
+            if not input_path or not os.path.isfile(input_path):
+                messagebox.showerror("Error", "Drop a video file or click the drop zone to browse first.")
+                return
+            source_display = os.path.basename(input_path)
+        else:
+            url = self.url_value.get().strip()
+            if not url:
+                messagebox.showerror("Error", "Paste a video URL first.")
+                return
+            source_display = url
+
+        try:
+            segments = parse_timestamps_text(timestamps_text)
+        except ValueError as e:
+            messagebox.showerror("Invalid timestamps", str(e))
+            return
+
+        try:
+            export_options = self._gather_export_options()
+        except ValueError as e:
+            messagebox.showerror("Invalid export options", str(e))
+            return
+
+        job = {
+            "mode": mode,
+            "input_path": self.input_path.get().strip() if mode == "file" else None,
+            "url": self.url_value.get().strip() if mode == "url" else None,
+            "segments": segments,
+            "reencode": self.reencode_var.get(),
+            "keep_clips": self.keep_temp_var.get(),
+            "cookies_browser": None if self.cookies_browser.get() == "None" else self.cookies_browser.get(),
+            "cookies_profile": self.cookies_profile.get().strip() or None,
+            "cookies_file": self.cookies_file.get().strip() or None,
+            "quality": self.quality_var.get(),
+            "auto_pot_server": self.auto_pot_var.get(),
+            "pot_server_dir": self.pot_server_dir.get().strip() or None,
+            "export_options": export_options,
+            "source_display": source_display,
+            "status": "Queued",
+        }
+        self.queue.append(job)
+        item_id = self.queue_tree.insert("", "end", values=(source_display, "Queued"))
+        job["_tree_id"] = item_id
+        self.log(f"Added to queue: {source_display}")
+
+    def on_remove_from_queue(self):
+        if self._queue_running:
+            messagebox.showwarning("Queue running", "Wait for the queue to finish before editing it.")
+            return
+        selected = self.queue_tree.selection()
+        if not selected:
+            return
+        for item_id in selected:
+            self.queue = [j for j in self.queue if j.get("_tree_id") != item_id]
+            self.queue_tree.delete(item_id)
+
+    def on_clear_queue(self):
+        if self._queue_running:
+            messagebox.showwarning("Queue running", "Wait for the queue to finish before clearing it.")
+            return
+        self.queue.clear()
+        for item_id in self.queue_tree.get_children():
+            self.queue_tree.delete(item_id)
+
+    def on_run_queue(self):
+        if self.is_running or self._queue_running:
+            return
+        if not self.queue:
+            messagebox.showinfo("Queue is empty", "Add at least one job to the queue first.")
+            return
+        if not check_ffmpeg_available():
+            messagebox.showerror(
+                "ffmpeg not found",
+                "Place ffmpeg.exe and ffprobe.exe next to this program, or install "
+                "ffmpeg from https://ffmpeg.org/download.html and add it to PATH.",
+            )
+            return
+
+        self._queue_running = True
+        self.run_button.configure(state="disabled")
+        self.run_queue_button.configure(state="disabled")
+        self.set_running(True)
+
+        def worker():
+            saved_paths = []
+            for job in list(self.queue):
+                item_id = job["_tree_id"]
+                self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "Running..."))
+                self.log(f"--- Starting queued job: {job['source_display']} ---")
+                self.progress_bar["value"] = 0
+                work_dir = tempfile.mkdtemp(prefix="clipstitch_")
+                try:
+                    if job["mode"] == "file":
+                        final_path = run_pipeline_from_file(
+                            job["input_path"], job["segments"], job["reencode"], log=self.log,
+                            progress=self.set_progress, work_dir=work_dir,
+                            keep_clips=job["keep_clips"], export_options=job["export_options"],
+                        )
+                        suggested_name = sanitize_filename(
+                            os.path.splitext(os.path.basename(job["input_path"]))[0] + "_clipped"
+                        )
+                    else:
+                        title = fetch_url_title(job["url"], self.log, job["cookies_browser"],
+                                                 job["cookies_profile"], job["cookies_file"])
+                        suggested_name = sanitize_filename(title) if title else "clip"
+                        final_path = run_pipeline_from_url(
+                            job["url"], job["segments"], log=self.log, progress=self.set_progress,
+                            work_dir=work_dir, cookies_browser=job["cookies_browser"],
+                            cookies_profile=job["cookies_profile"], cookies_file=job["cookies_file"],
+                            quality=job["quality"], auto_pot_server=job["auto_pot_server"],
+                            pot_server_dir=job["pot_server_dir"], keep_clips=job["keep_clips"],
+                            export_options=job["export_options"],
+                        )
+
+                    # Queued jobs auto-save (no per-job dialog) so the whole
+                    # queue can run unattended.
+                    default_folder = self._default_output_folder()
+                    os.makedirs(default_folder, exist_ok=True)
+                    dest = self._avoid_overwrite(os.path.join(default_folder, suggested_name + ".mp4"))
+                    shutil.move(final_path, dest)
+
+                    if job["keep_clips"]:
+                        clips_src = os.path.join(work_dir, "clips")
+                        if os.path.isdir(clips_src):
+                            clips_dest = self._avoid_overwrite(os.path.splitext(dest)[0] + "_clips")
+                            shutil.move(clips_src, clips_dest)
+
+                    for src_name, suffix in [("output.webm", ".webm"), ("output.mp3", ".mp3"),
+                                              ("output_thumb.jpg", "_thumb.jpg"), ("output.gif", ".gif")]:
+                        src_path = os.path.join(work_dir, src_name)
+                        if os.path.isfile(src_path):
+                            extra_dest = self._avoid_overwrite(os.path.splitext(dest)[0] + suffix)
+                            shutil.move(src_path, extra_dest)
+
+                    saved_paths.append(dest)
+                    self.log(f"Saved: {dest}")
+                    self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "\u2705 Done"))
+                except Exception as e:
+                    self.log(f"ERROR in queued job '{job['source_display']}': {e}")
+                    self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "\u274c Failed"))
+                finally:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+
+            self.queue.clear()
+            self._queue_running = False
+            self.root.after(0, lambda: self.run_button.configure(state="normal"))
+            self.root.after(0, lambda: self.run_queue_button.configure(state="normal"))
+            self.root.after(0, lambda: self.set_running(False))
+            if saved_paths:
+                summary = "\n".join(os.path.basename(p) for p in saved_paths)
+                self.root.after(0, lambda: self._show_success(os.path.dirname(saved_paths[0])))
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def main():

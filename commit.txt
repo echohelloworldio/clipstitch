@@ -1,0 +1,31 @@
+feat: add export presets, crossfade, batch queue, and side-exports
+
+Adds the "Tier 1" content-creator features to ClipStitch:
+
+- Aspect ratio / platform presets (TikTok/Shorts 9:16, YouTube 16:9,
+  Instagram Square 1:1) via a scale+crop filter that adapts to any
+  source aspect ratio.
+- Audio loudness normalization (single-pass loudnorm) so joined
+  clips don't jump between loud and quiet.
+- Crossfade transitions between clips (configurable duration) as an
+  alternative to a hard cut, with automatic fallback to a plain join
+  if clips are too short or too numerous for a clean transition.
+- Side-exports generated alongside the main clip: WebM (VP9/Opus),
+  MP3 audio-only, a JPG thumbnail, and a GIF - each at a
+  user-chosen timestamp within the final clip.
+- A batch queue: add multiple jobs (local file or URL, each with its
+  own timestamps and export settings) and run them all unattended,
+  with per-job status shown in a queue list and auto-save to a
+  default output folder.
+
+Also:
+- Progress bar math now accounts for the extra encode passes (filters,
+  crossfade, side-exports) so it still advances smoothly and
+  proportionally instead of stalling during the new stages.
+- Refactored per-clip post-processing into apply_post_filters() and
+  extracted a shared _run_ffmpeg_with_progress() helper used by every
+  re-encoding step (filters, crossfade, WebM export) for consistent
+  live progress reporting.
+
+No breaking changes to existing local-file or URL clipping workflows;
+all new options are opt-in and collapsed by default in the UI.

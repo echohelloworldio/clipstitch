@@ -1,0 +1,3 @@
+# This is a sample timestamp.txt file you can use to clip videos. Each line is a separate clip.
+00:00:00, 00:04:00
+00:05:35, 00:06:45
