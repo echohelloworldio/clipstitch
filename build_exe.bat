@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 echo Installing/upgrading PyInstaller and yt-dlp...
-python -m pip install --upgrade pyinstaller yt-dlp pycryptodomex tkinterdnd2
+python -m pip install --upgrade pyinstaller yt-dlp pycryptodomex tkinterdnd2 customtkinter Pillow
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies. Check your internet connection.
     pause
@@ -40,6 +40,8 @@ python -m PyInstaller --onefile --windowed --name "VideoClipper" ^
   --collect-all certifi ^
   --collect-all Cryptodome ^
   --collect-all tkinterdnd2 ^
+  --collect-all customtkinter ^
+  --collect-all PIL ^
   video_clipper_gui.py
 
 if errorlevel 1 (

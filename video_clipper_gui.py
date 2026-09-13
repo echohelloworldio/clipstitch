@@ -51,7 +51,13 @@ import time
 import urllib.error
 import urllib.request
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox
+
+try:
+    import customtkinter as ctk
+    CTK_AVAILABLE = True
+except ImportError:
+    CTK_AVAILABLE = False
 
 try:
     import yt_dlp
@@ -273,6 +279,32 @@ def get_video_duration(input_path):
         return None
 
 
+def extract_preview_frame_bytes(input_path, timestamp_seconds, max_width=480, timeout=10):
+    """Grabs a single JPEG-encoded frame near timestamp_seconds using a fast,
+    keyframe-based ffmpeg seek (-ss before -i). Returns raw JPEG bytes.
+    Raises RuntimeError on failure (bad path, ffmpeg missing/failed, or a
+    timeout) so callers can show a friendly message instead of crashing.
+    Used for the scrub-preview player, not for the actual clipping pipeline."""
+    timestamp_seconds = max(0.0, timestamp_seconds)
+    cmd = [
+        FFMPEG_BIN, "-ss", f"{timestamp_seconds:.3f}", "-i", input_path,
+        "-frames:v", "1", "-an", "-f", "image2pipe", "-vcodec", "mjpeg",
+        "-vf", f"scale={max_width}:-2",
+        "-loglevel", "error", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timed out grabbing a preview frame.")
+    except OSError as e:
+        raise RuntimeError(f"Couldn't run ffmpeg: {e}")
+    if not result.stdout:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(err or "ffmpeg produced no frame data at that position.")
+    return result.stdout
+
+
 def cut_clip(input_path, start, end, out_path, reencode, on_progress=None):
     """Cuts one clip with ffmpeg, reporting live fractional progress
     (0.0-1.0) via on_progress as ffmpeg reports how far into the clip it
@@ -345,44 +377,78 @@ def cut_clip(input_path, start, end, out_path, reencode, on_progress=None):
 def _make_progress_hook(log, label, on_progress=None):
     """Reports real download progress into the GUI log (throttled) and,
     via on_progress, a live fractional value (0.0-1.0) for the progress
-    bar - computed from actual bytes downloaded, not just start/finish."""
-    state = {"last_logged_pct": -100}
+    bar.
+
+    Byte totals (downloaded_bytes/total_bytes) are the primary source,
+    but yt-dlp very often can't report a total size at all when
+    downloading just a SECTION of a video (our download_ranges usage) -
+    fragmented/DASH sources in particular. fragment_index/fragment_count
+    is reported for those same fragmented downloads and gives a reliable
+    fraction even when the byte total is unknown.
+
+    IMPORTANT: when the format selector pulls video and audio as
+    separate streams (the common "bestvideo+bestaudio" case), yt-dlp
+    calls this SAME hook once per stream, each restarting from 0 bytes.
+    Naively forwarding raw per-stream fractions makes the reported
+    progress jump forward for the video stream, then regress back down
+    when the audio stream starts - which is exactly what made the bar
+    look broken/frozen. This tracks how many streams ('phases') make up
+    the overall download (via info_dict's requested_formats, when
+    present) and reports a combined, monotonically non-decreasing
+    fraction across all of them instead."""
+    state = {"last_logged_pct": -100, "completed_phases": 0, "total_phases": 1}
 
     def hook(d):
         status = d.get("status")
+        requested = (d.get("info_dict") or {}).get("requested_formats")
+        if requested:
+            state["total_phases"] = max(state["total_phases"], len(requested))
+
         if status == "downloading":
             downloaded = d.get("downloaded_bytes") or 0
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            frag_index = d.get("fragment_index")
+            frag_count = d.get("fragment_count")
             pct_str = (d.get("_percent_str") or "").strip()
             speed_str = (d.get("_speed_str") or "").strip()
             eta_str = (d.get("_eta_str") or "").strip()
 
-            frac = None
             if total:
-                frac = min(1.0, max(0.0, downloaded / total))
+                phase_frac = min(1.0, max(0.0, downloaded / total))
+            elif frag_count:
+                # No byte total available (common for section/fragmented
+                # downloads) - fall back to fragments completed, which
+                # yt-dlp does report even then.
+                phase_frac = min(1.0, max(0.0, (frag_index or 0) / frag_count))
             else:
-                try:
-                    frac = float(re.sub(r"[^\d.]", "", pct_str)) / 100 if pct_str else None
-                except ValueError:
-                    frac = None
+                phase_frac = None
 
-            if on_progress and frac is not None:
-                on_progress(frac)
+            if on_progress and phase_frac is not None:
+                overall = (state["completed_phases"] + phase_frac) / state["total_phases"]
+                on_progress(min(1.0, max(0.0, overall)))
 
-            pct_display = frac * 100 if frac is not None else None
+            pct_display = phase_frac * 100 if phase_frac is not None else None
             if pct_display is None or pct_display - state["last_logged_pct"] >= 5 or pct_display >= 99.5:
-                bits = [f"{label}: {pct_str or '...'}"]
-                if speed_str:
+                stream_note = (f" (part {state['completed_phases'] + 1}/{state['total_phases']})"
+                                if state["total_phases"] > 1 else "")
+                if pct_str.strip().upper().startswith("N/A") and frag_count:
+                    bits = [f"{label}{stream_note}: fragment {frag_index or 0}/{frag_count}"]
+                else:
+                    bits = [f"{label}{stream_note}: {pct_str or '...'}"]
+                if speed_str and not speed_str.strip().upper().startswith("UNKNOWN"):
                     bits.append(f"at {speed_str}")
-                if eta_str:
+                if eta_str and eta_str.strip() != "Unknown":
                     bits.append(f"ETA {eta_str}")
                 log("  " + " ".join(bits))
                 if pct_display is not None:
                     state["last_logged_pct"] = pct_display
         elif status == "finished":
+            state["completed_phases"] = min(state["total_phases"], state["completed_phases"] + 1)
+            state["last_logged_pct"] = -100
             if on_progress:
-                on_progress(1.0)
-            log(f"  {label}: download finished, merging/processing...")
+                on_progress(min(1.0, state["completed_phases"] / state["total_phases"]))
+            if state["completed_phases"] >= state["total_phases"]:
+                log(f"  {label}: download finished, merging/processing...")
         elif status == "error":
             log(f"  {label}: an error occurred during download.")
 
@@ -429,10 +495,20 @@ QUALITY_PRESETS = {
 
 def download_segment(url, start, end, out_path, log, cookies_browser=None,
                       cookies_profile=None, cookies_file=None, label="Downloading",
-                      quality="Best available", on_progress=None):
+                      quality="Best available", on_progress=None, precise_cuts=False):
     """Download only one timestamped section of a URL directly at the
     source, using yt-dlp's download-sections feature, then mux it into a
-    single mp4 with ffmpeg."""
+    single mp4 with ffmpeg.
+
+    precise_cuts controls yt-dlp's force_keyframes_at_cuts: when True, it
+    re-encodes the whole downloaded section with ffmpeg so the cut lands
+    on the exact frame - this is what makes URL clipping noticeably
+    slower than a plain yt-dlp download, since a full re-encode is CPU-
+    bound and can easily take longer than the download itself. Default
+    False snaps to the nearest keyframe instead (typically within a
+    couple seconds), which is dramatically faster and matches the
+    fast-by-default behavior of the local-file 'frame-accurate cuts'
+    toggle elsewhere in this app."""
     if not YT_DLP_AVAILABLE:
         raise RuntimeError(
             "yt-dlp is not installed. Install it with:\n    pip install yt-dlp"
@@ -449,7 +525,7 @@ def download_segment(url, start, end, out_path, log, cookies_browser=None,
         "merge_output_format": "mp4",
         "outtmpl": out_template + ".%(ext)s",
         "download_ranges": download_range_func(None, [(start, end)]),
-        "force_keyframes_at_cuts": True,
+        "force_keyframes_at_cuts": precise_cuts,
         "quiet": True,
         "no_warnings": True,
         "noprogress": False,
@@ -567,16 +643,59 @@ def check_url(url, log, cookies_browser=None, cookies_profile=None, cookies_file
         "uploader": info.get("uploader") or "(unknown uploader)",
         "duration": seconds_to_timestamp(duration) if duration else "(unknown)",
         "extractor": info.get("extractor_key") or info.get("extractor") or "(unknown site)",
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+def fetch_url_preview(url, cookies_browser=None, cookies_profile=None, cookies_file=None):
+    """Lightweight, non-raising metadata fetch used for the live link
+    preview as the user types/pastes a URL. Returns a dict with
+    title/uploader/duration/thumbnail (any of which may be None), or
+    None entirely on failure. Deliberately quiet - this runs on a
+    background thread on every URL change, so it must never pop up
+    dialogs or spam the log."""
+    if not YT_DLP_AVAILABLE:
+        return None
+    ydl_opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "skip_download": True, "logger": _YtDlpLogger(lambda m: None),
+        "socket_timeout": 10, "retries": 1,
+    }
+    ydl_opts.update(_build_cookie_and_client_opts(cookies_browser, cookies_profile, cookies_file))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        return None
+
+    duration = info.get("duration")
+    return {
+        "title": info.get("title") or "(untitled)",
+        "uploader": info.get("uploader") or "(unknown uploader)",
+        "duration": seconds_to_timestamp(duration) if duration else None,
+        "thumbnail": info.get("thumbnail"),
     }
 
 
 class _YtDlpLogger:
     """Routes yt-dlp's internal log messages into our GUI log box."""
+    # Postprocessing (merging video+audio, fixups, embedding, etc.) happens
+    # AFTER the progress_hooks download phase finishes, with no progress
+    # percentage available at all - it used to look like the app had
+    # frozen right when it was actually busy muxing/converting. yt-dlp
+    # reports these steps through logger.debug() the same as its
+    # (filtered-out) per-fragment spam, so we specifically let these
+    # through instead of silently dropping everything but "[download]".
+    _POSTPROCESS_PREFIXES = (
+        "[Merger]", "[ffmpeg]", "[Metadata]", "[VideoRemuxer]", "[VideoConvertor]",
+        "[ExtractAudio]", "[EmbedThumbnail]", "[EmbedSubtitle]", "[Fixup", "[MoveFiles]",
+    )
+
     def __init__(self, log_fn):
         self.log_fn = log_fn
 
     def debug(self, msg):
-        if msg.startswith("[download]") or "Destination" in msg:
+        if msg.startswith("[download]") or "Destination" in msg or msg.startswith(self._POSTPROCESS_PREFIXES):
             self.log_fn(f"  {msg}")
 
     def info(self, msg):
@@ -981,7 +1100,8 @@ def run_pipeline_from_file(input_path, segments, reencode, log, progress, work_d
 def run_pipeline_from_url(url, segments, log, progress, work_dir,
                            cookies_browser=None, cookies_profile=None, cookies_file=None,
                            quality="Best available", auto_pot_server=True,
-                           pot_server_dir=None, keep_clips=False, export_options=None):
+                           pot_server_dir=None, keep_clips=False, export_options=None,
+                           precise_cuts=False):
     """Downloads only the timestamped sections + joins them. Writes the
     final result to work_dir/output.mp4 and returns that path.
 
@@ -1013,6 +1133,10 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
     total_dur = sum(max(end - start, 0.001) for start, end in segments) or 1.0
     clip_paths = []
     log(f"Found {len(segments)} segment(s) to download directly from the URL.")
+    if precise_cuts:
+        log("  Precise cut points enabled: each section will be re-encoded after "
+            "downloading for frame-exact start/end points - this is noticeably "
+            "slower than a plain download.")
     cum_weight = 0.0
 
     for idx, (start, end) in enumerate(segments, start=1):
@@ -1030,7 +1154,7 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
             url, start, end, clip_path, log,
             cookies_browser=cookies_browser, cookies_profile=cookies_profile,
             cookies_file=cookies_file, label=label, quality=quality,
-            on_progress=on_seg_progress,
+            on_progress=on_seg_progress, precise_cuts=precise_cuts,
         )
         clip_paths.append(clip_path)
         cum_weight += seg_weight
@@ -1074,14 +1198,42 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
 # GUI
 # ----------------------------------------------------------------------
 
-ACCENT = "#2f6fed"
-ACCENT_DARK = "#2555bd"
-BG = "#f5f6f8"
-CARD_BG = "#ffffff"
-BORDER = "#d8dce3"
-TEXT_MUTED = "#6b7280"
-DROP_ZONE_IDLE_BG = "#fafbfc"
-DROP_ZONE_HOVER_BG = "#eef4ff"
+# ----------------------------------------------------------------------
+# GUI (CustomTkinter — dark, card-based, LocalSend/Spotify/Netflix-ish)
+# ----------------------------------------------------------------------
+
+import io
+from PIL import Image
+
+if not CTK_AVAILABLE:
+    raise SystemExit(
+        "ClipStitch needs the 'customtkinter' package for its interface.\n"
+        "Install it with:\n    pip install customtkinter"
+    )
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# --- Palette -----------------------------------------------------------
+BG = "#0e0f13"              # app background (near-black, Spotify/Netflix-ish)
+BG_ELEVATED = "#15171d"     # header / top-level surface
+CARD_BG = "#1a1d24"         # card surfaces
+CARD_BG_HOVER = "#20232c"
+BORDER = "#2a2e38"
+TEXT = "#f2f3f5"
+TEXT_MUTED = "#9aa1ad"
+TEXT_FAINT = "#6b7280"
+ACCENT = "#4c7bfa"
+ACCENT_HOVER = "#3d63d9"
+ACCENT_SOFT = "#22283a"
+DANGER = "#ef4444"
+SUCCESS = "#3ecf8e"
+DROP_ZONE_IDLE_BG = "#161920"
+DROP_ZONE_HOVER_BG = "#1b2333"
+LOG_BG = "#0a0b0e"
+
+FONT_FAMILY = "Segoe UI"
+MONO_FAMILY = "Consolas"
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv")
 
@@ -1102,21 +1254,80 @@ FUN_STATUS_WORDS = [
 ]
 
 
-def _make_root():
-    if DND_AVAILABLE:
-        return TkinterDnD.Tk()
-    return tk.Tk()
+def _f(size=13, weight="normal"):
+    return ctk.CTkFont(family=FONT_FAMILY, size=size, weight=weight)
+
+
+def _mono(size=11):
+    return ctk.CTkFont(family=MONO_FAMILY, size=size)
+
+
+# --- Root: CTk + drag-and-drop, gracefully degrading -------------------
+if DND_AVAILABLE:
+    class _DnDRoot(TkinterDnD.Tk, ctk.CTk):
+        def __init__(self, *args, **kwargs):
+            ctk.CTk.__init__(self, *args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+
+    def _make_root():
+        return _DnDRoot()
+else:
+    def _make_root():
+        return ctk.CTk()
+
+
+def _card(parent, **kwargs):
+    """A standard elevated card container."""
+    defaults = dict(fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER)
+    defaults.update(kwargs)
+    return ctk.CTkFrame(parent, **defaults)
+
+
+def _row(parent, **kwargs):
+    defaults = dict(fg_color="transparent")
+    defaults.update(kwargs)
+    return ctk.CTkFrame(parent, **defaults)
+
+
+def _section_label(parent, text, **kwargs):
+    defaults = dict(font=_f(13, "bold"), text_color=TEXT, anchor="w")
+    defaults.update(kwargs)
+    return ctk.CTkLabel(parent, text=text, **defaults)
+
+
+def _muted_label(parent, text, **kwargs):
+    defaults = dict(font=_f(11), text_color=TEXT_MUTED, anchor="w")
+    defaults.update(kwargs)
+    return ctk.CTkLabel(parent, text=text, **defaults)
+
+
+def _secondary_button(parent, text, command, **kwargs):
+    defaults = dict(
+        font=_f(11), fg_color="transparent", hover_color=CARD_BG_HOVER,
+        text_color=TEXT_MUTED, border_width=1, border_color=BORDER,
+        corner_radius=8, height=30,
+    )
+    defaults.update(kwargs)
+    return ctk.CTkButton(parent, text=text, command=command, **defaults)
+
+
+def _ghost_button(parent, text, command, **kwargs):
+    """Borderless toggle-style button (Advanced/Export headers)."""
+    defaults = dict(
+        font=_f(11, "bold"), fg_color="transparent", hover_color=BG_ELEVATED,
+        text_color=TEXT_MUTED, anchor="w", corner_radius=6, height=28,
+    )
+    defaults.update(kwargs)
+    return ctk.CTkButton(parent, text=text, command=command, **defaults)
 
 
 class VideoClipperApp:
     def __init__(self, root):
         self.root = root
         root.title("ClipStitch")
-        root.geometry("760x780")
-        root.minsize(640, 560)
-        root.configure(bg=BG)
-
-        self._setup_styles()
+        root.geometry("820x860")
+        root.minsize(680, 600)
+        root.configure(fg_color=BG)
 
         self.source_mode = tk.StringVar(value="file")
         self.input_path = tk.StringVar()
@@ -1128,6 +1339,7 @@ class VideoClipperApp:
         self.cookies_file = tk.StringVar(value="")
         self.quality_var = tk.StringVar(value="Best available")
         self.auto_pot_var = tk.BooleanVar(value=True)
+        self.precise_url_cuts_var = tk.BooleanVar(value=False)
         self.pot_server_dir = tk.StringVar(value=DEFAULT_POT_SERVER_DIR)
         self.advanced_visible = tk.BooleanVar(value=False)
 
@@ -1151,6 +1363,7 @@ class VideoClipperApp:
 
         self.queue = []  # list of job dicts
         self._queue_running = False
+        self._queue_rows = {}  # job id -> row widgets
 
         self._build_layout()
         self._update_source_mode()
@@ -1169,101 +1382,45 @@ class VideoClipperApp:
                       "pip install tkinterdnd2")
 
     # ------------------------------------------------------------------
-    # Styling
-    # ------------------------------------------------------------------
-    def _setup_styles(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        style.configure("TFrame", background=BG)
-        style.configure("Card.TFrame", background=CARD_BG)
-        style.configure("TLabel", background=BG, foreground="#1f2430", font=("Segoe UI", 10))
-        style.configure("Card.TLabel", background=CARD_BG, foreground="#1f2430", font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=BG, foreground=TEXT_MUTED, font=("Segoe UI", 9))
-        style.configure("CardMuted.TLabel", background=CARD_BG, foreground=TEXT_MUTED, font=("Segoe UI", 9))
-        style.configure("Title.TLabel", background=BG, foreground="#12151c",
-                         font=("Segoe UI", 20, "bold"))
-        style.configure("Subtitle.TLabel", background=BG, foreground=TEXT_MUTED,
-                         font=("Segoe UI", 10))
-        style.configure("SectionHeader.TLabel", background=BG, foreground="#12151c",
-                         font=("Segoe UI", 11, "bold"))
-
-        style.configure("Segmented.TRadiobutton", font=("Segoe UI", 10), padding=(16, 8))
-        style.map("Segmented.TRadiobutton",
-                  background=[("selected", ACCENT), ("!selected", CARD_BG)],
-                  foreground=[("selected", "#ffffff"), ("!selected", "#1f2430")])
-
-        style.configure("Accent.TButton", font=("Segoe UI", 11, "bold"),
-                         padding=(18, 10), foreground="#ffffff", background=ACCENT)
-        style.map("Accent.TButton", background=[("active", ACCENT_DARK), ("disabled", "#a9bdf0")])
-
-        style.configure("Secondary.TButton", font=("Segoe UI", 9), padding=(10, 5))
-
-        style.configure("Advanced.TButton", font=("Segoe UI", 9), padding=(4, 4),
-                         background=BG, borderwidth=0)
-
-        style.configure("Card.TCheckbutton", background=CARD_BG, font=("Segoe UI", 9))
-        style.configure("TCheckbutton", background=BG, font=("Segoe UI", 9))
-
-        style.configure("Horizontal.TProgressbar", troughcolor="#e5e7eb",
-                         background=ACCENT, thickness=10)
-
-    # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
     def _build_layout(self):
-        outer = ttk.Frame(self.root, style="TFrame")
-        outer.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(outer, highlightthickness=0, bg=BG)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        main = ttk.Frame(canvas, style="TFrame", padding=(24, 20))
-        main_window = canvas.create_window((0, 0), window=main, anchor="nw")
-
-        def _on_main_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_configure(event):
-            canvas.itemconfig(main_window, width=event.width)
-
-        main.bind("<Configure>", _on_main_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        scroll = ctk.CTkScrollableFrame(self.root, fg_color=BG,
+                                         scrollbar_button_color=BORDER,
+                                         scrollbar_button_hover_color=TEXT_FAINT)
+        scroll.pack(fill="both", expand=True, padx=0, pady=0)
+        main = scroll  # alias: everything below packs into this scrollable frame
 
         # --- Header ---
-        header = ttk.Frame(main, style="TFrame")
-        header.pack(fill="x", pady=(0, 18))
-        ttk.Label(header, text="ClipStitch", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Clip. Stitch. Done.", style="Subtitle.TLabel").pack(anchor="w")
+        header = _row(main)
+        header.pack(fill="x", padx=28, pady=(24, 18))
+        ctk.CTkLabel(header, text="ClipStitch", font=_f(26, "bold"),
+                     text_color=TEXT, anchor="w").pack(anchor="w")
+        _muted_label(header, "Clip. Stitch. Done.", font=_f(12)).pack(anchor="w", pady=(2, 0))
+
+        body = _row(main)
+        body.pack(fill="x", padx=28, pady=(0, 24))
 
         # --- Source toggle ---
-        toggle_row = ttk.Frame(main, style="TFrame")
-        toggle_row.pack(fill="x", pady=(0, 10))
-        ttk.Radiobutton(
-            toggle_row, text="\U0001F4C1  Local file", variable=self.source_mode, value="file",
-            style="Segmented.TRadiobutton", command=self._update_source_mode,
-        ).pack(side="left")
-        ttk.Radiobutton(
-            toggle_row, text="\U0001F310  From URL", variable=self.source_mode, value="url",
-            style="Segmented.TRadiobutton", command=self._update_source_mode,
-        ).pack(side="left", padx=(6, 0))
+        self.source_toggle = ctk.CTkSegmentedButton(
+            body, values=["\U0001F4C1  Local file", "\U0001F310  From URL"],
+            font=_f(12), selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+            unselected_color=CARD_BG, unselected_hover_color=CARD_BG_HOVER,
+            fg_color=CARD_BG, text_color=TEXT, height=36, corner_radius=9,
+            command=self._on_source_toggle,
+        )
+        self.source_toggle.set("\U0001F4C1  Local file")
+        self.source_toggle.pack(fill="x", pady=(0, 12))
 
         # --- Drop zone (local file mode) ---
-        self.drop_zone = tk.Frame(main, bg=DROP_ZONE_IDLE_BG, highlightbackground=BORDER,
-                                   highlightthickness=2, bd=0, cursor="hand2")
-        self.drop_zone_label = tk.Label(
+        self.drop_zone = ctk.CTkFrame(body, fg_color=DROP_ZONE_IDLE_BG, corner_radius=12,
+                                       border_width=2, border_color=BORDER, cursor="hand2")
+        self.drop_zone_label = ctk.CTkLabel(
             self.drop_zone, text="\U0001F4E5  Drag & drop a video here\nor click to browse",
-            bg=DROP_ZONE_IDLE_BG, fg=TEXT_MUTED, font=("Segoe UI", 11), justify="center",
+            font=_f(13), text_color=TEXT_MUTED, justify="center",
         )
-        self.drop_zone_label.pack(expand=True, fill="both", pady=28)
-        self.drop_zone.pack(fill="x", pady=(0, 6))
+        self.drop_zone_label.pack(expand=True, fill="both", pady=36)
+        self.drop_zone.pack(fill="x", pady=(0, 8))
         for widget in (self.drop_zone, self.drop_zone_label):
             widget.bind("<Button-1>", lambda e: self.browse_input())
         if DND_AVAILABLE:
@@ -1272,268 +1429,428 @@ class VideoClipperApp:
             self.drop_zone.dnd_bind("<<DropEnter>>", lambda e: self._set_drop_zone_hover(True))
             self.drop_zone.dnd_bind("<<DropLeave>>", lambda e: self._set_drop_zone_hover(False))
 
-        self.selected_file_label = ttk.Label(main, text="", style="Muted.TLabel")
+        self.selected_file_label = _muted_label(body, "")
         self.selected_file_label.pack(fill="x", pady=(0, 10))
 
         # --- URL input (url mode) ---
-        self.url_frame = ttk.Frame(main, style="TFrame")
-        url_input_row = ttk.Frame(self.url_frame, style="TFrame")
+        self.url_frame = _row(body)
+        url_input_row = _row(self.url_frame)
         url_input_row.pack(fill="x")
-        self.url_entry = ttk.Entry(url_input_row, textvariable=self.url_value, font=("Segoe UI", 10))
-        self.url_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 8))
-        ttk.Button(url_input_row, text="Check", style="Secondary.TButton",
-                   command=self.on_check_url).pack(side="left")
-        ttk.Label(self.url_frame, text="YouTube and 1000+ other sites are supported.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(4, 10))
+        self.url_entry = ctk.CTkEntry(
+            url_input_row, textvariable=self.url_value, font=_f(12), height=36,
+            fg_color=CARD_BG, border_color=BORDER, text_color=TEXT,
+            placeholder_text="Paste a video URL...",
+        )
+        self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _secondary_button(url_input_row, "Check", self.on_check_url, height=36).pack(side="left")
+        _muted_label(self.url_frame, "YouTube and 1000+ other sites are supported."
+                     ).pack(anchor="w", pady=(6, 10))
+
+        # --- Live link preview (thumbnail + title, fetched as you paste) ---
+        self.url_preview_card = _card(self.url_frame, fg_color=BG_ELEVATED)
+        self._url_preview_thumb_image = None  # keep a ref so CTkImage isn't GC'd
+        preview_inner = _row(self.url_preview_card, fg_color="transparent")
+        preview_inner.pack(fill="x", padx=10, pady=10)
+        self.url_preview_thumb_label = ctk.CTkLabel(
+            preview_inner, text="", width=120, height=68, fg_color=CARD_BG, corner_radius=8,
+        )
+        self.url_preview_thumb_label.pack(side="left", padx=(0, 12))
+        preview_text_col = _row(preview_inner, fg_color="transparent")
+        preview_text_col.pack(side="left", fill="both", expand=True)
+        self.url_preview_title_label = ctk.CTkLabel(
+            preview_text_col, text="", font=_f(12, "bold"), text_color=TEXT,
+            anchor="w", justify="left", wraplength=440,
+        )
+        self.url_preview_title_label.pack(anchor="w", fill="x")
+        self.url_preview_meta_label = _muted_label(preview_text_col, "")
+        self.url_preview_meta_label.pack(anchor="w", fill="x", pady=(4, 0))
+        # not packed yet - only shown once there's something to preview
+
+        self._url_preview_job = None
+        self._url_preview_cache = {}
+        self._url_preview_last_fetched = None
+        self.url_value.trace_add("write", self._on_url_value_changed)
+
+        # --- Preview & mark clips (local files only) ---
+        _section_label(body, "Preview & mark clips").pack(anchor="w", pady=(6, 2))
+        self.preview_card = _card(body)
+        self.preview_card.pack(fill="x", pady=(0, 4))
+
+        self.preview_placeholder_label = _muted_label(
+            self.preview_card, "Select a local video above to scrub through it and mark clips here.",
+        )
+        self.preview_placeholder_label.pack(anchor="w", padx=16, pady=16)
+
+        self.preview_content = _row(self.preview_card)
+        # not packed yet - shown once a local file is selected
+
+        preview_pad = {"padx": 16}
+        img_row = _row(self.preview_content)
+        img_row.pack(fill="x", padx=16, pady=(14, 8))
+        self.preview_image_label = ctk.CTkLabel(
+            img_row, text="", width=480, height=270, fg_color=BG_ELEVATED, corner_radius=8,
+        )
+        self.preview_image_label.pack()
+        self._preview_ctk_image = None  # keep a reference so it isn't GC'd
+
+        slider_row = _row(self.preview_content)
+        slider_row.pack(fill="x", **preview_pad, pady=(0, 2))
+        self.preview_slider = ctk.CTkSlider(
+            slider_row, from_=0, to=1, number_of_steps=1000, height=16,
+            fg_color=BORDER, progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER, command=self._on_preview_slider_moved,
+        )
+        self.preview_slider.set(0)
+        self.preview_slider.pack(fill="x")
+
+        time_row = _row(self.preview_content)
+        time_row.pack(fill="x", **preview_pad, pady=(2, 10))
+        self.preview_time_label = _muted_label(time_row, "0:00 / 0:00")
+        self.preview_time_label.pack(side="left")
+        self.preview_marks_label = _muted_label(time_row, "In: --   Out: --")
+        self.preview_marks_label.pack(side="right")
+
+        controls_row = _row(self.preview_content)
+        controls_row.pack(fill="x", **preview_pad, pady=(0, 8))
+        _secondary_button(controls_row, "\u23EA 5s", lambda: self._preview_seek_relative(-5),
+                           width=56).pack(side="left")
+        _secondary_button(controls_row, "\u25C0 1s", lambda: self._preview_seek_relative(-1),
+                           width=56).pack(side="left", padx=(4, 0))
+        self.preview_play_btn = ctk.CTkButton(
+            controls_row, text="\u25B6  Play", font=_f(12, "bold"), width=90, height=30,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+            corner_radius=8, command=self._toggle_preview_play,
+        )
+        self.preview_play_btn.pack(side="left", padx=(10, 10))
+        _secondary_button(controls_row, "1s \u25B6", lambda: self._preview_seek_relative(1),
+                           width=56).pack(side="left")
+        _secondary_button(controls_row, "5s \u23E9", lambda: self._preview_seek_relative(5),
+                           width=56).pack(side="left", padx=(4, 0))
+
+        marks_row = _row(self.preview_content)
+        marks_row.pack(fill="x", padx=16, pady=(0, 16))
+        _secondary_button(marks_row, "Set In", self._preview_set_in).pack(side="left")
+        _secondary_button(marks_row, "Set Out", self._preview_set_out
+                           ).pack(side="left", padx=(6, 0))
+        _secondary_button(marks_row, "Clear marks", self._preview_clear_marks
+                           ).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(
+            marks_row, text="+ Add clip to Timestamps", font=_f(12, "bold"), height=30,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+            corner_radius=8, command=self._preview_add_clip,
+        ).pack(side="right")
+
+        # Preview player state
+        self.preview_duration = 0.0
+        self.preview_current_time = 0.0
+        self.preview_in_point = None
+        self.preview_out_point = None
+        self.preview_playing = False
+        self._preview_loaded_path = None
+        self._preview_frame_inflight = False
+        self._preview_pending_seek = None
+        self._preview_play_job = None
+        self._preview_last_tick = None
 
         # --- Timestamps ---
-        ttk.Label(main, text="Timestamps", style="SectionHeader.TLabel").pack(anchor="w", pady=(4, 2))
-        ttk.Label(main, text="One clip per line: START,END  (e.g. 00:00:10,00:00:45). "
-                              "You can also drag a .txt file onto the drop zone above.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+        _section_label(body, "Timestamps").pack(anchor="w", pady=(6, 2))
+        _muted_label(body, "One clip per line: START,END  (e.g. 00:00:10,00:00:45). "
+                            "You can also drag a .txt file onto the drop zone above."
+                     ).pack(anchor="w", pady=(0, 8))
 
-        ts_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
-        ts_frame.pack(fill="x", pady=(0, 4))
-        self.timestamps_box = tk.Text(ts_frame, height=6, wrap="none", bd=0, padx=10, pady=8,
-                                       font=("Consolas", 10), fg="#1f2430", bg=CARD_BG,
-                                       insertbackground="#1f2430")
-        self.timestamps_box.pack(fill="both", expand=True)
+        ts_card = _card(body)
+        ts_card.pack(fill="x", pady=(0, 4))
+        self.timestamps_box = ctk.CTkTextbox(
+            ts_card, height=130, wrap="none", fg_color=CARD_BG, text_color=TEXT_MUTED,
+            font=_mono(12), corner_radius=12, border_width=0,
+        )
+        self.timestamps_box.pack(fill="both", expand=True, padx=2, pady=2)
         self._placeholder_text = "00:00:10,00:00:45\n00:02:00,00:03:15"
         self._show_placeholder()
         self.timestamps_box.bind("<FocusIn>", self._clear_placeholder)
 
-        ts_actions = ttk.Frame(main, style="TFrame")
-        ts_actions.pack(fill="x", pady=(4, 16))
-        ttk.Button(ts_actions, text="Load from .txt file...", style="Secondary.TButton",
-                   command=self.load_timestamps_file).pack(side="right")
+        ts_actions = _row(body)
+        ts_actions.pack(fill="x", pady=(8, 18))
+        _secondary_button(ts_actions, "Load from .txt file...",
+                           self.load_timestamps_file).pack(side="right")
 
         # --- Advanced (collapsible) ---
-        adv_toggle_row = ttk.Frame(main, style="TFrame")
-        adv_toggle_row.pack(fill="x")
-        self.advanced_toggle_btn = ttk.Button(
-            adv_toggle_row, text="\u25B8  Advanced options", style="Advanced.TButton",
-            command=self._toggle_advanced,
+        self.advanced_toggle_btn = _ghost_button(
+            body, "\u25B8  Advanced options", self._toggle_advanced,
         )
         self.advanced_toggle_btn.pack(anchor="w")
 
-        self.advanced_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER,
-                                        highlightthickness=1)
+        self.advanced_frame = _card(body)
         self._build_advanced_contents(self.advanced_frame)
         # not packed yet - toggled on demand
 
         # --- Export options (collapsible) ---
-        export_toggle_row = ttk.Frame(main, style="TFrame")
-        export_toggle_row.pack(fill="x", pady=(6, 0))
         self.export_visible = tk.BooleanVar(value=False)
-        self.export_toggle_btn = ttk.Button(
-            export_toggle_row, text="\u25B8  Export options (presets, crossfade, extras)",
-            style="Advanced.TButton", command=self._toggle_export_options,
+        self.export_toggle_btn = _ghost_button(
+            body, "\u25B8  Export options (presets, crossfade, extras)",
+            self._toggle_export_options,
         )
-        self.export_toggle_btn.pack(anchor="w")
+        self.export_toggle_btn.pack(anchor="w", pady=(8, 0))
 
-        self.export_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER,
-                                      highlightthickness=1)
+        self.export_frame = _card(body)
         self._build_export_contents(self.export_frame)
         # not packed yet - toggled on demand
 
         # --- Batch queue ---
-        queue_header_row = ttk.Frame(main, style="TFrame")
-        queue_header_row.pack(fill="x", pady=(16, 4))
-        ttk.Label(queue_header_row, text="Batch queue", style="SectionHeader.TLabel").pack(side="left")
-        ttk.Label(queue_header_row, text="(optional - queue up several jobs to run unattended)",
-                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        queue_header_row = _row(body)
+        queue_header_row.pack(fill="x", pady=(22, 8))
+        _section_label(queue_header_row, "Batch queue").pack(side="left")
+        _muted_label(queue_header_row, "  (optional - queue up several jobs to run unattended)"
+                     ).pack(side="left")
 
-        queue_frame = tk.Frame(main, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
-        queue_frame.pack(fill="x", pady=(0, 6))
-        self.queue_tree = ttk.Treeview(
-            queue_frame, columns=("source", "status"), show="headings", height=4,
+        self.queue_card = _card(body)
+        self.queue_card.pack(fill="x", pady=(0, 8))
+        queue_head = _row(self.queue_card)
+        queue_head.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(queue_head, text="Source", font=_f(11, "bold"), text_color=TEXT_MUTED,
+                     anchor="w").pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(queue_head, text="Status", font=_f(11, "bold"), text_color=TEXT_MUTED,
+                     anchor="w", width=110).pack(side="right")
+        self.queue_list_frame = _row(self.queue_card)
+        self.queue_list_frame.pack(fill="x", padx=14, pady=(0, 12))
+        self._queue_empty_label = _muted_label(self.queue_list_frame, "No jobs queued yet.")
+        self._queue_empty_label.pack(anchor="w", pady=(2, 4))
+
+        queue_btn_row = _row(body)
+        queue_btn_row.pack(fill="x", pady=(0, 4))
+        _secondary_button(queue_btn_row, "+ Add current setup to queue",
+                           self.on_add_to_queue).pack(side="left")
+        _secondary_button(queue_btn_row, "Remove selected",
+                           self.on_remove_from_queue).pack(side="left", padx=(6, 0))
+        _secondary_button(queue_btn_row, "Clear queue",
+                           self.on_clear_queue).pack(side="left", padx=(6, 0))
+        self.run_queue_button = _secondary_button(
+            queue_btn_row, "\u25B6  Run Queue", self.on_run_queue,
+            text_color=TEXT, border_color=ACCENT,
         )
-        self.queue_tree.heading("source", text="Source")
-        self.queue_tree.heading("status", text="Status")
-        self.queue_tree.column("source", width=420, anchor="w")
-        self.queue_tree.column("status", width=140, anchor="w")
-        self.queue_tree.pack(fill="x", padx=1, pady=1)
-
-        queue_btn_row = ttk.Frame(main, style="TFrame")
-        queue_btn_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(queue_btn_row, text="+ Add current setup to queue", style="Secondary.TButton",
-                   command=self.on_add_to_queue).pack(side="left")
-        ttk.Button(queue_btn_row, text="Remove selected", style="Secondary.TButton",
-                   command=self.on_remove_from_queue).pack(side="left", padx=(6, 0))
-        ttk.Button(queue_btn_row, text="Clear queue", style="Secondary.TButton",
-                   command=self.on_clear_queue).pack(side="left", padx=(6, 0))
-        self.run_queue_button = ttk.Button(queue_btn_row, text="\u25B6  Run Queue", style="Secondary.TButton",
-                                            command=self.on_run_queue)
         self.run_queue_button.pack(side="right")
 
         # --- Run button + progress ---
-        run_row = ttk.Frame(main, style="TFrame")
-        run_row.pack(fill="x", pady=(18, 2))
-        self.run_button = ttk.Button(run_row, text="\u2702  Clip It", style="Accent.TButton",
-                                      command=self.on_run)
-        self.run_button.pack(side="left")
-        self.progress_bar = ttk.Progressbar(run_row, mode="determinate", maximum=100,
-                                             style="Horizontal.TProgressbar")
-        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(14, 0), ipady=2)
-
-        self.progress_label = ttk.Label(main, text="", style="Muted.TLabel")
-        self.progress_label.pack(anchor="w", pady=(4, 6))
-
-        # --- Log (collapsible-ish, visible by default but compact) ---
-        ttk.Label(main, text="Activity log", style="Muted.TLabel").pack(anchor="w", pady=(14, 2))
-        log_frame = tk.Frame(main, bg="#12151c")
-        log_frame.pack(fill="both", expand=True, pady=(0, 10))
-        self.log_box = scrolledtext.ScrolledText(
-            log_frame, height=9, state="disabled", bd=0, bg="#12151c", fg="#d7dae0",
-            insertbackground="#d7dae0", font=("Consolas", 9), padx=10, pady=8,
+        run_row = _row(body)
+        run_row.pack(fill="x", pady=(24, 4))
+        self.run_button = ctk.CTkButton(
+            run_row, text="\u2702  Clip It", font=_f(14, "bold"), height=44,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+            corner_radius=10, command=self.on_run,
         )
-        self.log_box.pack(fill="both", expand=True)
+        self.run_button.pack(side="left")
+        self.progress_bar = ctk.CTkProgressBar(
+            run_row, height=10, corner_radius=6, fg_color=BORDER,
+            progress_color=ACCENT,
+        )
+        self.progress_bar.set(0)
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(16, 0))
+
+        self.progress_label = _muted_label(body, "")
+        self.progress_label.pack(anchor="w", pady=(8, 4))
+
+        # --- Log ---
+        _muted_label(body, "Activity log").pack(anchor="w", pady=(16, 4))
+        log_card = ctk.CTkFrame(body, fg_color=LOG_BG, corner_radius=12,
+                                 border_width=1, border_color=BORDER)
+        log_card.pack(fill="both", expand=True, pady=(0, 24))
+        self.log_box = ctk.CTkTextbox(
+            log_card, height=170, fg_color=LOG_BG, text_color="#c9cdd6",
+            font=_mono(11), corner_radius=12, border_width=0, state="disabled",
+        )
+        self.log_box.pack(fill="both", expand=True, padx=2, pady=2)
 
     def _build_advanced_contents(self, parent):
-        pad = {"padx": 14, "pady": 6}
+        pad = {"padx": 16, "pady": 6}
 
-        ttk.Label(parent, text="These only matter for URL downloads - safe to ignore for local files.",
-                  style="CardMuted.TLabel").pack(anchor="w", padx=14, pady=(12, 6))
+        _muted_label(parent, "These only matter for URL downloads - safe to ignore for local files."
+                     ).pack(anchor="w", padx=16, pady=(14, 8))
 
         # Quality
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Label(row, text="Quality", style="Card.TLabel", width=16).pack(side="left")
-        ttk.Combobox(row, textvariable=self.quality_var, state="readonly", width=18,
-                     values=list(QUALITY_PRESETS.keys())).pack(side="left")
+        ctk.CTkLabel(row, text="Quality", font=_f(12), text_color=TEXT,
+                     anchor="w", width=160).pack(side="left")
+        ctk.CTkComboBox(row, variable=self.quality_var, state="readonly", width=200,
+                         fg_color=BG_ELEVATED, border_color=BORDER, button_color=BORDER,
+                         button_hover_color=ACCENT, text_color=TEXT, dropdown_fg_color=CARD_BG,
+                         values=list(QUALITY_PRESETS.keys())).pack(side="left")
+
+        # Precise cut points (speed vs. exactness tradeoff for URL downloads)
+        row = _row(parent)
+        row.pack(fill="x", **pad)
+        ctk.CTkCheckBox(row, text="Precise cut points (re-encodes each section - much slower)",
+                         variable=self.precise_url_cuts_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
+        _muted_label(
+            parent, "Off (default) snaps to the nearest keyframe, usually within a "
+                    "couple seconds - this is why URL clips download much faster than "
+                    "a full re-encode. Turn this on only if you need frame-exact starts.",
+            wraplength=680, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 4))
 
         # Cookies from browser
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Label(row, text="Cookies from browser", style="Card.TLabel", width=16).pack(side="left")
-        ttk.Combobox(row, textvariable=self.cookies_browser, state="readonly", width=12,
-                     values=["None", "Chrome", "Firefox", "Edge", "Brave", "Opera", "Vivaldi"]
+        ctk.CTkLabel(row, text="Cookies from browser", font=_f(12), text_color=TEXT,
+                     anchor="w", width=160).pack(side="left")
+        ctk.CTkComboBox(row, variable=self.cookies_browser, state="readonly", width=130,
+                         fg_color=BG_ELEVATED, border_color=BORDER, button_color=BORDER,
+                         button_hover_color=ACCENT, text_color=TEXT, dropdown_fg_color=CARD_BG,
+                         values=["None", "Chrome", "Firefox", "Edge", "Brave", "Opera", "Vivaldi"]
+                         ).pack(side="left")
+        ctk.CTkLabel(row, text="Profile:", font=_f(12), text_color=TEXT_MUTED
+                     ).pack(side="left", padx=(14, 6))
+        ctk.CTkEntry(row, textvariable=self.cookies_profile, width=120, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
                      ).pack(side="left")
-        ttk.Label(row, text="Profile:", style="Card.TLabel").pack(side="left", padx=(12, 4))
-        ttk.Entry(row, textvariable=self.cookies_profile, width=12).pack(side="left")
 
         # Cookies file
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Label(row, text="cookies.txt (recommended)", style="Card.TLabel", width=22).pack(side="left")
-        ttk.Entry(row, textvariable=self.cookies_file).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(row, text="Browse", style="Secondary.TButton",
-                   command=self.browse_cookies_file).pack(side="left")
+        ctk.CTkLabel(row, text="cookies.txt (recommended)", font=_f(12), text_color=TEXT,
+                     anchor="w", width=200).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.cookies_file, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _secondary_button(row, "Browse", self.browse_cookies_file, height=28).pack(side="left")
 
         # PO token server
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Auto-start PO Token server (best quality on restricted videos)",
-                         variable=self.auto_pot_var, style="Card.TCheckbutton").pack(side="left")
+        ctk.CTkCheckBox(row, text="Auto-start PO Token server (best quality on restricted videos)",
+                         variable=self.auto_pot_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
 
-        row = ttk.Frame(parent, style="Card.TFrame")
-        row.pack(fill="x", padx=14, pady=(0, 6))
-        ttk.Label(row, text="Server folder:", style="Card.TLabel").pack(side="left")
-        ttk.Entry(row, textvariable=self.pot_server_dir).pack(side="left", fill="x", expand=True, padx=(6, 6))
-        ttk.Button(row, text="Browse", style="Secondary.TButton",
-                   command=self.browse_pot_server_dir).pack(side="left")
+        row = _row(parent)
+        row.pack(fill="x", padx=16, pady=(0, 6))
+        ctk.CTkLabel(row, text="Server folder:", font=_f(12), text_color=TEXT_MUTED
+                     ).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.pot_server_dir, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", fill="x", expand=True, padx=(8, 8))
+        _secondary_button(row, "Browse", self.browse_pot_server_dir, height=28).pack(side="left")
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=14, pady=8)
+        sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
+        sep.pack(fill="x", padx=16, pady=10)
 
         # Local-file specific
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Frame-accurate cuts (re-encode, slower, exact timing)",
-                         variable=self.reencode_var, style="Card.TCheckbutton").pack(side="left")
+        ctk.CTkCheckBox(row, text="Frame-accurate cuts (re-encode, slower, exact timing)",
+                         variable=self.reencode_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
 
-        row = ttk.Frame(parent, style="Card.TFrame")
-        row.pack(fill="x", padx=14, pady=(0, 14))
-        ttk.Checkbutton(row, text="Keep individual clips (not just the joined result)",
-                         variable=self.keep_temp_var, style="Card.TCheckbutton").pack(side="left")
+        row = _row(parent)
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkCheckBox(row, text="Keep individual clips (not just the joined result)",
+                         variable=self.keep_temp_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
 
-        note = ttk.Label(
-            parent,
-            text="Only clip videos you own or have rights/permission to use.",
-            style="CardMuted.TLabel", wraplength=640, justify="left",
-        )
-        note.pack(anchor="w", padx=14, pady=(0, 12))
+        _muted_label(
+            parent, "Only clip videos you own or have rights/permission to use.",
+            wraplength=680, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 14))
 
     def _toggle_advanced(self):
         visible = not self.advanced_visible.get()
         self.advanced_visible.set(visible)
         if visible:
             self.advanced_toggle_btn.configure(text="\u25BE  Advanced options")
-            self.advanced_frame.pack(fill="x", pady=(6, 0), before=self._run_row_anchor())
+            self.advanced_frame.pack(fill="x", pady=(8, 0), after=self.advanced_toggle_btn)
         else:
             self.advanced_toggle_btn.configure(text="\u25B8  Advanced options")
             self.advanced_frame.pack_forget()
-
-    def _run_row_anchor(self):
-        # the run_button's parent frame is packed right after advanced - find it
-        return self.run_button.master
 
     def _toggle_export_options(self):
         visible = not self.export_visible.get()
         self.export_visible.set(visible)
         if visible:
             self.export_toggle_btn.configure(text="\u25BE  Export options (presets, crossfade, extras)")
-            self.export_frame.pack(fill="x", pady=(6, 0), before=self._run_row_anchor())
+            self.export_frame.pack(fill="x", pady=(8, 0), after=self.export_toggle_btn)
         else:
             self.export_toggle_btn.configure(text="\u25B8  Export options (presets, crossfade, extras)")
             self.export_frame.pack_forget()
 
     def _build_export_contents(self, parent):
-        pad = {"padx": 14, "pady": 6}
+        pad = {"padx": 16, "pady": 6}
 
         # Aspect preset
-        row = ttk.Frame(parent, style="Card.TFrame")
-        row.pack(fill="x", padx=14, pady=(12, 6))
-        ttk.Label(row, text="Aspect / preset", style="Card.TLabel", width=16).pack(side="left")
-        ttk.Combobox(row, textvariable=self.aspect_preset_var, state="readonly", width=28,
-                     values=list(ASPECT_PRESETS.keys())).pack(side="left")
-        ttk.Label(parent, text="Crops+scales for TikTok/Shorts, YouTube, or Instagram. "
-                                "Forces a re-encode.", style="CardMuted.TLabel"
-                  ).pack(anchor="w", padx=14, pady=(0, 8))
+        row = _row(parent)
+        row.pack(fill="x", padx=16, pady=(14, 6))
+        ctk.CTkLabel(row, text="Aspect / preset", font=_f(12), text_color=TEXT,
+                     anchor="w", width=160).pack(side="left")
+        ctk.CTkComboBox(row, variable=self.aspect_preset_var, state="readonly", width=280,
+                         fg_color=BG_ELEVATED, border_color=BORDER, button_color=BORDER,
+                         button_hover_color=ACCENT, text_color=TEXT, dropdown_fg_color=CARD_BG,
+                         values=list(ASPECT_PRESETS.keys())).pack(side="left")
+        _muted_label(parent, "Crops+scales for TikTok/Shorts, YouTube, or Instagram. "
+                             "Forces a re-encode.").pack(anchor="w", padx=16, pady=(0, 10))
 
         # Normalize audio
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Normalize audio loudness (consistent volume across clips)",
-                         variable=self.normalize_audio_var, style="Card.TCheckbutton").pack(side="left")
+        ctk.CTkCheckBox(row, text="Normalize audio loudness (consistent volume across clips)",
+                         variable=self.normalize_audio_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
 
         # Crossfade
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Crossfade between clips instead of a hard cut, duration (s):",
-                         variable=self.crossfade_var, style="Card.TCheckbutton").pack(side="left")
-        ttk.Entry(row, textvariable=self.crossfade_duration_var, width=5).pack(side="left", padx=(6, 0))
-        ttk.Label(parent, text="Only applies when there are 2+ clips; forces a re-encode.",
-                  style="CardMuted.TLabel").pack(anchor="w", padx=14, pady=(0, 8))
+        ctk.CTkCheckBox(row, text="Crossfade between clips instead of a hard cut, duration (s):",
+                         variable=self.crossfade_var, font=_f(12), text_color=TEXT,
+                         fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.crossfade_duration_var, width=56, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(8, 0))
+        _muted_label(parent, "Only applies when there are 2+ clips; forces a re-encode."
+                     ).pack(anchor="w", padx=16, pady=(0, 10))
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=14, pady=4)
+        sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
+        sep.pack(fill="x", padx=16, pady=6)
 
         # Side exports
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Also export a WebM version", variable=self.export_webm_var,
-                         style="Card.TCheckbutton").pack(side="left")
-        ttk.Checkbutton(row, text="Also export audio-only (MP3)", variable=self.export_mp3_var,
-                         style="Card.TCheckbutton").pack(side="left", padx=(20, 0))
+        ctk.CTkCheckBox(row, text="Also export a WebM version", variable=self.export_webm_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER).pack(side="left")
+        ctk.CTkCheckBox(row, text="Also export audio-only (MP3)", variable=self.export_mp3_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER
+                         ).pack(side="left", padx=(24, 0))
 
         # Thumbnail
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = _row(parent)
         row.pack(fill="x", **pad)
-        ttk.Checkbutton(row, text="Save a thumbnail at", variable=self.thumbnail_var,
-                         style="Card.TCheckbutton").pack(side="left")
-        ttk.Entry(row, textvariable=self.thumbnail_time_var, width=8).pack(side="left", padx=(6, 4))
-        ttk.Label(row, text="(time within the FINAL clip, e.g. 0:02)",
-                  style="CardMuted.TLabel").pack(side="left")
+        ctk.CTkCheckBox(row, text="Save a thumbnail at", variable=self.thumbnail_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.thumbnail_time_var, width=70, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(8, 6))
+        _muted_label(row, "(time within the FINAL clip, e.g. 0:02)").pack(side="left")
 
         # GIF
-        row = ttk.Frame(parent, style="Card.TFrame")
-        row.pack(fill="x", padx=14, pady=(0, 14))
-        ttk.Checkbutton(row, text="Save a GIF starting at", variable=self.gif_var,
-                         style="Card.TCheckbutton").pack(side="left")
-        ttk.Entry(row, textvariable=self.gif_start_var, width=8).pack(side="left", padx=(6, 8))
-        ttk.Label(row, text="for", style="Card.TLabel").pack(side="left")
-        ttk.Entry(row, textvariable=self.gif_duration_var, width=5).pack(side="left", padx=(4, 4))
-        ttk.Label(row, text="seconds (within the FINAL clip)",
-                  style="CardMuted.TLabel").pack(side="left")
+        row = _row(parent)
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkCheckBox(row, text="Save a GIF starting at", variable=self.gif_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.gif_start_var, width=70, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(8, 10))
+        ctk.CTkLabel(row, text="for", font=_f(12), text_color=TEXT).pack(side="left")
+        ctk.CTkEntry(row, textvariable=self.gif_duration_var, width=50, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(6, 6))
+        _muted_label(row, "seconds (within the FINAL clip)").pack(side="left")
 
     def _gather_export_options(self):
         """Reads the Export options panel into the dict the pipeline
@@ -1578,20 +1895,330 @@ class VideoClipperApp:
     # ------------------------------------------------------------------
     # Source mode / drop zone
     # ------------------------------------------------------------------
+    def _on_source_toggle(self, value):
+        self.source_mode.set("file" if value.endswith("Local file") else "url")
+        self._update_source_mode()
+
     def _update_source_mode(self):
         mode = self.source_mode.get()
         if mode == "file":
             self.url_frame.pack_forget()
-            self.drop_zone.pack(fill="x", pady=(0, 6), before=self.selected_file_label)
-            self.reencode_var_state = "normal"
+            self.drop_zone.pack(fill="x", pady=(0, 8), before=self.selected_file_label)
         else:
             self.drop_zone.pack_forget()
-            self.url_frame.pack(fill="x", pady=(0, 6), before=self.selected_file_label)
+            self.url_frame.pack(fill="x", pady=(0, 8), before=self.selected_file_label)
+        self._refresh_preview_panel_visibility()
+
+    # ------------------------------------------------------------------
+    # Scrub preview / mark-clips player (local files only)
+    # ------------------------------------------------------------------
+    def _refresh_preview_panel_visibility(self):
+        mode = self.source_mode.get()
+        if mode == "url":
+            self._stop_preview_playback()
+            self.preview_content.pack_forget()
+            self.preview_placeholder_label.configure(
+                text="Preview is available for local files only - URL clips only "
+                     "download the sections you request, so there's nothing to "
+                     "scrub through yet."
+            )
+            self.preview_placeholder_label.pack(anchor="w", padx=16, pady=16)
+        elif not self._preview_loaded_path:
+            self.preview_content.pack_forget()
+            self.preview_placeholder_label.configure(
+                text="Select a local video above to scrub through it and mark clips here."
+            )
+            self.preview_placeholder_label.pack(anchor="w", padx=16, pady=16)
+        else:
+            self.preview_placeholder_label.pack_forget()
+            self.preview_content.pack(fill="x")
+
+    def _load_preview_for_file(self, path):
+        self._stop_preview_playback()
+        self._preview_loaded_path = path
+        self.preview_in_point = None
+        self.preview_out_point = None
+        self.preview_current_time = 0.0
+        self._preview_pending_seek = None
+        self.preview_slider.set(0)
+        self._update_preview_marks_label()
+        self._refresh_preview_panel_visibility()
+
+        if not check_ffmpeg_available():
+            self.preview_time_label.configure(text="ffmpeg not found - preview unavailable")
+            return
+
+        self.preview_time_label.configure(text="Loading preview...")
+
+        def worker():
+            duration = get_video_duration(path)
+
+            def apply():
+                if path != self._preview_loaded_path:
+                    return  # a different file was selected meanwhile
+                self.preview_duration = duration or 0.0
+                self.preview_slider.configure(to=max(self.preview_duration, 0.1))
+                self._update_preview_time_label()
+                self._preview_request_frame(0.0)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_preview_time_label(self):
+        cur = seconds_to_timestamp(self.preview_current_time)
+        total = seconds_to_timestamp(self.preview_duration)
+        self.preview_time_label.configure(text=f"{cur} / {total}")
+
+    def _update_preview_marks_label(self):
+        in_text = seconds_to_timestamp(self.preview_in_point) if self.preview_in_point is not None else "--"
+        out_text = seconds_to_timestamp(self.preview_out_point) if self.preview_out_point is not None else "--"
+        self.preview_marks_label.configure(text=f"In: {in_text}   Out: {out_text}")
+
+    def _on_preview_slider_moved(self, value):
+        self._preview_seek_to(float(value))
+
+    def _preview_seek_relative(self, delta_seconds):
+        if not self._preview_loaded_path:
+            return
+        self._preview_seek_to(self.preview_current_time + delta_seconds)
+
+    def _preview_seek_to(self, t):
+        t = max(0.0, min(self.preview_duration, t))
+        self.preview_current_time = t
+        self.preview_slider.set(t)
+        self._update_preview_time_label()
+        self._preview_request_frame(t)
+
+    def _preview_request_frame(self, t):
+        if not self._preview_loaded_path:
+            return
+        if self._preview_frame_inflight:
+            self._preview_pending_seek = t
+            return
+
+        self._preview_frame_inflight = True
+        path = self._preview_loaded_path
+
+        def worker():
+            image = None
+            error = None
+            try:
+                jpeg_bytes = extract_preview_frame_bytes(path, t, max_width=480)
+                image = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+            except Exception as e:
+                error = str(e)
+
+            def apply():
+                self._preview_frame_inflight = False
+                if path != self._preview_loaded_path:
+                    pass  # stale - a new file was loaded, just drop this frame
+                elif image is not None:
+                    ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
+                    self._preview_ctk_image = ctk_image
+                    self.preview_image_label.configure(image=ctk_image, text="")
+                elif error:
+                    self.preview_image_label.configure(image=None, text="\u26A0  Couldn't load frame")
+
+                pending = self._preview_pending_seek
+                self._preview_pending_seek = None
+                if pending is not None and path == self._preview_loaded_path:
+                    self._preview_request_frame(pending)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _toggle_preview_play(self):
+        if not self._preview_loaded_path:
+            return
+        if self.preview_playing:
+            self._stop_preview_playback()
+        else:
+            self.preview_playing = True
+            self.preview_play_btn.configure(text="\u23F8  Pause")
+            self._preview_last_tick = time.time()
+            self._preview_play_tick()
+
+    def _stop_preview_playback(self):
+        self.preview_playing = False
+        self.preview_play_btn.configure(text="\u25B6  Play")
+        if self._preview_play_job is not None:
+            self.root.after_cancel(self._preview_play_job)
+            self._preview_play_job = None
+
+    def _preview_play_tick(self):
+        if not self.preview_playing:
+            return
+        now = time.time()
+        elapsed = now - self._preview_last_tick
+        self._preview_last_tick = now
+        new_time = self.preview_current_time + elapsed
+        if new_time >= self.preview_duration:
+            self._preview_seek_to(self.preview_duration)
+            self._stop_preview_playback()
+            return
+        self.preview_current_time = new_time
+        self.preview_slider.set(new_time)
+        self._update_preview_time_label()
+        self._preview_request_frame(new_time)
+        self._preview_play_job = self.root.after(150, self._preview_play_tick)
+
+    def _preview_set_in(self):
+        if not self._preview_loaded_path:
+            return
+        self.preview_in_point = self.preview_current_time
+        self._update_preview_marks_label()
+
+    def _preview_set_out(self):
+        if not self._preview_loaded_path:
+            return
+        self.preview_out_point = self.preview_current_time
+        self._update_preview_marks_label()
+
+    def _preview_clear_marks(self):
+        self.preview_in_point = None
+        self.preview_out_point = None
+        self._update_preview_marks_label()
+
+    def _preview_add_clip(self):
+        if self.preview_in_point is None or self.preview_out_point is None:
+            messagebox.showerror("Error", "Set both an In and an Out point first.")
+            return
+        start, end = self.preview_in_point, self.preview_out_point
+        if start >= end:
+            messagebox.showerror("Error", "The In point must come before the Out point.")
+            return
+
+        line = f"{seconds_to_timestamp(start)},{seconds_to_timestamp(end)}"
+        self._clear_placeholder()
+        current = self.timestamps_box.get("1.0", "end").rstrip("\n")
+        new_text = (current + "\n" + line) if current else line
+        self.timestamps_box.delete("1.0", "end")
+        self.timestamps_box.insert("1.0", new_text)
+        self.log(f"Added clip to timestamps: {line}")
+        self._preview_clear_marks()
+
+    # ------------------------------------------------------------------
+    # Live URL link preview (thumbnail + title, debounced background fetch)
+    # ------------------------------------------------------------------
+    def _on_url_value_changed(self, *_args):
+        if self._url_preview_job is not None:
+            self.root.after_cancel(self._url_preview_job)
+            self._url_preview_job = None
+
+        url = self.url_value.get().strip()
+        if not url.lower().startswith(("http://", "https://")):
+            self._hide_url_preview()
+            return
+
+        # Wait for a pause in typing/pasting before hitting the network.
+        self._url_preview_job = self.root.after(700, lambda: self._maybe_fetch_url_preview(url))
+
+    def _maybe_fetch_url_preview(self, url):
+        self._url_preview_job = None
+        if url != self.url_value.get().strip():
+            return  # stale - text changed again since this was scheduled
+
+        cached = self._url_preview_cache.get(url)
+        if cached is not None:
+            self._render_url_preview(url, cached)
+            return
+
+        if not YT_DLP_AVAILABLE:
+            return
+
+        self._url_preview_last_fetched = url
+        self._show_url_preview_loading()
+
+        def worker():
+            info = fetch_url_preview(
+                url,
+                cookies_browser=None if self.cookies_browser.get() == "None" else self.cookies_browser.get(),
+                cookies_profile=self.cookies_profile.get().strip() or None,
+                cookies_file=self.cookies_file.get().strip() or None,
+            )
+            thumb_image = None
+            if info and info.get("thumbnail"):
+                thumb_image = self._download_thumbnail(info["thumbnail"])
+
+            def apply():
+                # Only apply if this is still the URL currently in the box.
+                if url != self.url_value.get().strip():
+                    return
+                if info is None:
+                    self._hide_url_preview()
+                    return
+                info_with_image = dict(info)
+                # Build the CTkImage once, here on the main thread, and cache
+                # that (not the raw PIL image) - re-wrapping the same PIL
+                # image in a fresh CTkImage on every render can hand Tk a
+                # reference to an already-destroyed PhotoImage.
+                if thumb_image is not None:
+                    info_with_image["_thumb_ctk_image"] = ctk.CTkImage(
+                        light_image=thumb_image, dark_image=thumb_image, size=thumb_image.size,
+                    )
+                else:
+                    info_with_image["_thumb_ctk_image"] = None
+                self._url_preview_cache[url] = info_with_image
+                self._render_url_preview(url, info_with_image)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _download_thumbnail(thumb_url, max_size=(120, 68)):
+        """Fetches a thumbnail image and returns a PIL Image, or None on
+        any failure (missing Pillow support is impossible here since
+        customtkinter itself requires Pillow, but network/format issues
+        are common and must never crash the preview)."""
+        try:
+            with urllib.request.urlopen(thumb_url, timeout=8) as resp:
+                data = resp.read()
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            img.thumbnail(max_size)
+            return img
+        except Exception:
+            return None
+
+    def _show_url_preview_loading(self):
+        self.url_preview_thumb_label.configure(image=None, text="")
+        self.url_preview_title_label.configure(text="Loading preview...")
+        self.url_preview_meta_label.configure(text="")
+        if not self.url_preview_card.winfo_manager():
+            self.url_preview_card.pack(fill="x", pady=(0, 10))
+
+    def _render_url_preview(self, url, info):
+        if url != self.url_value.get().strip():
+            return  # stale
+
+        ctk_image = info.get("_thumb_ctk_image")
+        if ctk_image is not None:
+            self._url_preview_thumb_image = ctk_image  # keep a reference
+            self.url_preview_thumb_label.configure(image=ctk_image, text="")
+        else:
+            self._url_preview_thumb_image = None
+            self.url_preview_thumb_label.configure(image=None, text="\U0001F3AC")
+
+        self.url_preview_title_label.configure(text=info.get("title") or "(untitled)")
+        meta_bits = [info.get("uploader") or "(unknown uploader)"]
+        if info.get("duration"):
+            meta_bits.append(info["duration"])
+        self.url_preview_meta_label.configure(text="  \u2022  ".join(meta_bits))
+
+        if not self.url_preview_card.winfo_manager():
+            self.url_preview_card.pack(fill="x", pady=(0, 10))
+
+    def _hide_url_preview(self):
+        if self.url_preview_card.winfo_manager():
+            self.url_preview_card.pack_forget()
+        self._url_preview_thumb_image = None
 
     def _set_drop_zone_hover(self, hovering):
         bg = DROP_ZONE_HOVER_BG if hovering else DROP_ZONE_IDLE_BG
-        self.drop_zone.configure(bg=bg)
-        self.drop_zone_label.configure(bg=bg)
+        self.drop_zone.configure(fg_color=bg)
+        self.drop_zone_label.configure(fg_color=bg)
 
     def _on_drop_file(self, event):
         self._set_drop_zone_hover(False)
@@ -1606,12 +2233,14 @@ class VideoClipperApp:
                 with open(path, "r", encoding="utf-8") as f:
                     content = f.read()
                 self.timestamps_box.delete("1.0", "end")
-                self.timestamps_box.configure(fg="#1f2430")
+                self.timestamps_box.configure(text_color=TEXT)
                 self.timestamps_box.insert("1.0", content)
+                self._placeholder_active = False
             except OSError as e:
                 messagebox.showerror("Error", f"Couldn't read that file:\n{e}")
         elif ext in VIDEO_EXTENSIONS:
             self.source_mode.set("file")
+            self.source_toggle.set("\U0001F4C1  Local file")
             self._update_source_mode()
             self._set_input_file(path)
         else:
@@ -1626,6 +2255,7 @@ class VideoClipperApp:
         name = os.path.basename(path)
         self.selected_file_label.configure(text=f"\u2705  Selected: {name}")
         self.drop_zone_label.configure(text=f"\U0001F4E5  {name}\n(drop another to replace)")
+        self._load_preview_for_file(path)
 
     # ------------------------------------------------------------------
     # Placeholder handling for timestamps box
@@ -1633,13 +2263,13 @@ class VideoClipperApp:
     def _show_placeholder(self):
         self.timestamps_box.delete("1.0", "end")
         self.timestamps_box.insert("1.0", self._placeholder_text)
-        self.timestamps_box.configure(fg=TEXT_MUTED)
+        self.timestamps_box.configure(text_color=TEXT_FAINT)
         self._placeholder_active = True
 
     def _clear_placeholder(self, event=None):
         if getattr(self, "_placeholder_active", False):
             self.timestamps_box.delete("1.0", "end")
-            self.timestamps_box.configure(fg="#1f2430")
+            self.timestamps_box.configure(text_color=TEXT)
             self._placeholder_active = False
 
     def _get_timestamps_text(self):
@@ -1683,7 +2313,7 @@ class VideoClipperApp:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             self.timestamps_box.delete("1.0", "end")
-            self.timestamps_box.configure(fg="#1f2430")
+            self.timestamps_box.configure(text_color=TEXT)
             self.timestamps_box.insert("1.0", content)
             self._placeholder_active = False
 
@@ -1705,14 +2335,37 @@ class VideoClipperApp:
         frac = max(0.0, min(1.0, frac))
 
         def _update():
-            self._progress_frac = frac
-            self.progress_bar["value"] = frac * 100
+            # Never let the bar visibly move backward. Even with the
+            # combined-phase tracking in _make_progress_hook, other
+            # sources (retries, a new segment starting) can still hand
+            # us a smaller fraction than we already showed - clamp to
+            # the high-water mark instead of letting the bar regress.
+            prev_max = getattr(self, "_progress_max_frac", 0.0)
+            display_frac = max(frac, prev_max)
+            self._progress_max_frac = display_frac
+            if display_frac > getattr(self, "_progress_last_frac_for_advance", 0.0):
+                self._progress_last_advance_time = time.time()
+                self._progress_last_frac_for_advance = display_frac
+            self._progress_frac = display_frac
+            self.progress_bar.set(display_frac)
             self._refresh_progress_label()
         self.root.after(0, _update)
 
+    def set_running(self, running):
+        self.is_running = running
+        self.run_button.configure(state="disabled" if running else "normal")
+        if running:
+            self._start_progress_tracking()
+        else:
+            self._stop_progress_tracking()
+            self.progress_label.configure(text="")
+
     def _start_progress_tracking(self):
         self._progress_frac = 0.0
+        self._progress_max_frac = 0.0
         self._progress_start_time = time.time()
+        self._progress_last_advance_time = time.time()
+        self._progress_last_frac_for_advance = 0.0
         self._progress_eta_smoothed = None
         self._fun_word_index = 0
         self._fun_word_tick = 0
@@ -1743,14 +2396,21 @@ class VideoClipperApp:
             self.progress_label.configure(text="")
             return
 
-        eta_text = "estimating time..."
-        if frac > 0.03:
+        stalled_for = time.time() - getattr(self, "_progress_last_advance_time", time.time())
+
+        if frac > 0.03 and stalled_for < 4:
             elapsed = time.time() - getattr(self, "_progress_start_time", time.time())
             raw_eta = elapsed * (1 - frac) / frac
             smoothed = getattr(self, "_progress_eta_smoothed", None)
             eta = raw_eta if smoothed is None else (0.7 * smoothed + 0.3 * raw_eta)
             self._progress_eta_smoothed = eta
             eta_text = self._format_eta(eta)
+        else:
+            # No reliable ETA yet, or progress hasn't advanced in a few
+            # seconds (e.g. yt-dlp merging/remuxing after download, which
+            # reports no percentage at all). A frozen or wildly-wrong ETA
+            # here is worse than just being honest that it's still going.
+            eta_text = f"still working ({int(stalled_for)}s, no % available)" if stalled_for >= 4 else "estimating time..."
 
         self.progress_label.configure(text=f"{pct}%  \u2022  {eta_text}  \u2022  {word}")
 
@@ -1764,15 +2424,6 @@ class VideoClipperApp:
         minutes = int(seconds // 60)
         secs = int(seconds % 60)
         return f"~{minutes}m {secs}s remaining"
-
-    def set_running(self, running):
-        self.is_running = running
-        self.run_button.configure(state="disabled" if running else "normal")
-        if running:
-            self._start_progress_tracking()
-        else:
-            self._stop_progress_tracking()
-            self.progress_label.configure(text="")
 
     # ------------------------------------------------------------------
     # Check URL
@@ -1860,7 +2511,7 @@ class VideoClipperApp:
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
-        self.progress_bar["value"] = 0
+        self.progress_bar.set(0)
         self.set_running(True)
 
         work_dir = tempfile.mkdtemp(prefix="clipstitch_")
@@ -1897,6 +2548,7 @@ class VideoClipperApp:
                         cookies_file=cookies_file, quality=quality,
                         auto_pot_server=auto_pot_server, pot_server_dir=pot_server_dir,
                         keep_clips=keep_clips, export_options=export_options,
+                        precise_cuts=self.precise_url_cuts_var.get(),
                     )
 
                 self._pending_final_path = final_path
@@ -1916,54 +2568,62 @@ class VideoClipperApp:
     # ------------------------------------------------------------------
     # Save dialog (generate first, ask where to save after)
     # ------------------------------------------------------------------
+    def _dialog_shell(self, title, min_width=460):
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(title)
+        dialog.configure(fg_color=CARD_BG)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.after(50, dialog.grab_set)
+        dialog.minsize(min_width, 0)
+        return dialog
+
     def _show_save_dialog(self):
         final_path = self._pending_final_path
         if not final_path or not os.path.isfile(final_path):
             messagebox.showerror("Error", "Something went wrong - no output file was produced.")
             return
 
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Save your video")
-        dialog.configure(bg=CARD_BG)
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        dialog = self._dialog_shell("Save your video")
 
-        pad = {"padx": 20, "pady": 8}
+        pad = {"padx": 22, "pady": 8}
 
-        tk.Label(dialog, text="\u2728  Your clip is ready!", bg=CARD_BG,
-                 font=("Segoe UI", 13, "bold"), fg="#12151c").pack(anchor="w", padx=20, pady=(20, 4))
-        tk.Label(dialog, text="Choose where to save it and what to name it.",
-                 bg=CARD_BG, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=20, pady=(0, 14))
+        ctk.CTkLabel(dialog, text="\u2728  Your clip is ready!", font=_f(15, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=22, pady=(22, 4))
+        _muted_label(dialog, "Choose where to save it and what to name it."
+                     ).pack(anchor="w", padx=22, pady=(0, 16))
 
         default_folder = self._default_output_folder()
         folder_var = tk.StringVar(value=default_folder)
         name_var = tk.StringVar(value=self._pending_suggested_name)
 
-        row1 = ttk.Frame(dialog, style="Card.TFrame")
+        row1 = _row(dialog)
         row1.pack(fill="x", **pad)
-        ttk.Label(row1, text="Folder:", style="Card.TLabel", width=8).pack(side="left")
-        folder_entry = ttk.Entry(row1, textvariable=folder_var, width=42)
-        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkLabel(row1, text="Folder:", font=_f(12), text_color=TEXT_MUTED,
+                     width=64, anchor="w").pack(side="left")
+        folder_entry = ctk.CTkEntry(row1, textvariable=folder_var, height=32,
+                                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT)
+        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         def browse_folder():
             path = filedialog.askdirectory(title="Choose save folder", initialdir=folder_var.get())
             if path:
                 folder_var.set(path)
 
-        ttk.Button(row1, text="Browse", style="Secondary.TButton", command=browse_folder).pack(side="left")
+        _secondary_button(row1, "Browse", browse_folder, height=32).pack(side="left")
 
-        row2 = ttk.Frame(dialog, style="Card.TFrame")
+        row2 = _row(dialog)
         row2.pack(fill="x", **pad)
-        ttk.Label(row2, text="File name:", style="Card.TLabel", width=8).pack(side="left")
-        name_entry = ttk.Entry(row2, textvariable=name_var, width=42)
-        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(row2, text=".mp4", style="Card.TLabel").pack(side="left")
-        name_entry.icursor("end")
+        ctk.CTkLabel(row2, text="File name:", font=_f(12), text_color=TEXT_MUTED,
+                     width=64, anchor="w").pack(side="left")
+        name_entry = ctk.CTkEntry(row2, textvariable=name_var, height=32,
+                                   fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT)
+        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkLabel(row2, text=".mp4", font=_f(12), text_color=TEXT_MUTED).pack(side="left")
         name_entry.focus_set()
 
-        btn_row = ttk.Frame(dialog, style="Card.TFrame")
-        btn_row.pack(fill="x", padx=20, pady=(16, 20))
+        btn_row = _row(dialog)
+        btn_row.pack(fill="x", padx=22, pady=(18, 22))
 
         def _move_clips_folder(dest_video_path):
             clips_src = os.path.join(self._pending_work_dir, "clips")
@@ -2036,9 +2696,11 @@ class VideoClipperApp:
                 dialog.destroy()
                 messagebox.showerror("Error", f"Couldn't save the file:\n{e}")
 
-        ttk.Button(btn_row, text="Cancel (save to default folder)",
-                   style="Secondary.TButton", command=do_cancel).pack(side="left")
-        ttk.Button(btn_row, text="Save", style="Accent.TButton", command=do_save).pack(side="right")
+        _secondary_button(btn_row, "Cancel (save to default folder)", do_cancel
+                           ).pack(side="left")
+        ctk.CTkButton(btn_row, text="Save", font=_f(12, "bold"), height=34,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+                      corner_radius=8, command=do_save).pack(side="right")
 
         dialog.bind("<Return>", lambda e: do_save())
 
@@ -2057,21 +2719,16 @@ class VideoClipperApp:
         return f"{base} ({n}){ext}"
 
     def _show_success(self, dest_path):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Done")
-        dialog.configure(bg=CARD_BG)
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        dialog = self._dialog_shell("Done", min_width=420)
 
-        tk.Label(dialog, text="\u2705  Saved!", bg=CARD_BG, font=("Segoe UI", 13, "bold"),
-                 fg="#12151c").pack(anchor="w", padx=20, pady=(20, 4))
-        tk.Label(dialog, text=dest_path, bg=CARD_BG, fg=TEXT_MUTED,
-                 font=("Segoe UI", 9), wraplength=380, justify="left").pack(
-            anchor="w", padx=20, pady=(0, 16))
+        ctk.CTkLabel(dialog, text="\u2705  Saved!", font=_f(15, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=22, pady=(22, 4))
+        ctk.CTkLabel(dialog, text=dest_path, font=_f(11), text_color=TEXT_MUTED,
+                     wraplength=380, justify="left", anchor="w"
+                     ).pack(anchor="w", padx=22, pady=(0, 18))
 
-        btn_row = ttk.Frame(dialog, style="Card.TFrame")
-        btn_row.pack(fill="x", padx=20, pady=(0, 20))
+        btn_row = _row(dialog)
+        btn_row.pack(fill="x", padx=22, pady=(0, 22))
 
         def open_folder():
             folder = os.path.dirname(dest_path)
@@ -2085,16 +2742,45 @@ class VideoClipperApp:
             except OSError:
                 pass
 
-        ttk.Button(btn_row, text="Open Folder", style="Secondary.TButton",
-                   command=open_folder).pack(side="left")
-        ttk.Button(btn_row, text="Close", style="Accent.TButton",
-                   command=dialog.destroy).pack(side="right")
+        _secondary_button(btn_row, "Open Folder", open_folder).pack(side="left")
+        ctk.CTkButton(btn_row, text="Close", font=_f(12, "bold"), height=34,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+                      corner_radius=8, command=dialog.destroy).pack(side="right")
 
         self.log(f"Saved to: {dest_path}")
 
     # ------------------------------------------------------------------
     # Batch queue
     # ------------------------------------------------------------------
+    def _render_queue_row(self, job):
+        if self._queue_empty_label.winfo_manager():
+            self._queue_empty_label.pack_forget()
+
+        row = _row(self.queue_list_frame, fg_color=BG_ELEVATED)
+        row.pack(fill="x", pady=(0, 4))
+        row._selected = False
+
+        source_label = ctk.CTkLabel(row, text=job["source_display"], font=_f(11),
+                                     text_color=TEXT, anchor="w")
+        source_label.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=6)
+        status_label = ctk.CTkLabel(row, text=job["status"], font=_f(11),
+                                     text_color=TEXT_MUTED, width=110, anchor="w")
+        status_label.pack(side="right", padx=(6, 10), pady=6)
+
+        def toggle_select(event=None):
+            row._selected = not row._selected
+            row.configure(fg_color=ACCENT_SOFT if row._selected else BG_ELEVATED)
+
+        for w in (row, source_label, status_label):
+            w.bind("<Button-1>", toggle_select)
+
+        self._queue_rows[job["_id"]] = {"row": row, "status": status_label}
+
+    def _set_queue_row_status(self, job_id, text):
+        widgets = self._queue_rows.get(job_id)
+        if widgets:
+            widgets["status"].configure(text=text)
+
     def on_add_to_queue(self):
         mode = self.source_mode.get()
         timestamps_text = self._get_timestamps_text()
@@ -2124,7 +2810,9 @@ class VideoClipperApp:
             messagebox.showerror("Invalid export options", str(e))
             return
 
+        job_id = len(self.queue) + int(time.time() * 1000) % 100000
         job = {
+            "_id": job_id,
             "mode": mode,
             "input_path": self.input_path.get().strip() if mode == "file" else None,
             "url": self.url_value.get().strip() if mode == "url" else None,
@@ -2137,33 +2825,40 @@ class VideoClipperApp:
             "quality": self.quality_var.get(),
             "auto_pot_server": self.auto_pot_var.get(),
             "pot_server_dir": self.pot_server_dir.get().strip() or None,
+            "precise_cuts": self.precise_url_cuts_var.get(),
             "export_options": export_options,
             "source_display": source_display,
             "status": "Queued",
         }
         self.queue.append(job)
-        item_id = self.queue_tree.insert("", "end", values=(source_display, "Queued"))
-        job["_tree_id"] = item_id
+        self._render_queue_row(job)
         self.log(f"Added to queue: {source_display}")
 
     def on_remove_from_queue(self):
         if self._queue_running:
             messagebox.showwarning("Queue running", "Wait for the queue to finish before editing it.")
             return
-        selected = self.queue_tree.selection()
-        if not selected:
-            return
-        for item_id in selected:
-            self.queue = [j for j in self.queue if j.get("_tree_id") != item_id]
-            self.queue_tree.delete(item_id)
+        remaining = []
+        for job in self.queue:
+            widgets = self._queue_rows.get(job["_id"])
+            if widgets and widgets["row"]._selected:
+                widgets["row"].destroy()
+                del self._queue_rows[job["_id"]]
+            else:
+                remaining.append(job)
+        self.queue = remaining
+        if not self.queue:
+            self._queue_empty_label.pack(anchor="w", pady=(2, 4))
 
     def on_clear_queue(self):
         if self._queue_running:
             messagebox.showwarning("Queue running", "Wait for the queue to finish before clearing it.")
             return
+        for widgets in self._queue_rows.values():
+            widgets["row"].destroy()
+        self._queue_rows.clear()
         self.queue.clear()
-        for item_id in self.queue_tree.get_children():
-            self.queue_tree.delete(item_id)
+        self._queue_empty_label.pack(anchor="w", pady=(2, 4))
 
     def on_run_queue(self):
         if self.is_running or self._queue_running:
@@ -2187,10 +2882,10 @@ class VideoClipperApp:
         def worker():
             saved_paths = []
             for job in list(self.queue):
-                item_id = job["_tree_id"]
-                self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "Running..."))
+                job_id = job["_id"]
+                self.root.after(0, lambda i=job_id: self._set_queue_row_status(i, "Running..."))
                 self.log(f"--- Starting queued job: {job['source_display']} ---")
-                self.progress_bar["value"] = 0
+                self.progress_bar.set(0)
                 work_dir = tempfile.mkdtemp(prefix="clipstitch_")
                 try:
                     if job["mode"] == "file":
@@ -2213,6 +2908,7 @@ class VideoClipperApp:
                             quality=job["quality"], auto_pot_server=job["auto_pot_server"],
                             pot_server_dir=job["pot_server_dir"], keep_clips=job["keep_clips"],
                             export_options=job["export_options"],
+                            precise_cuts=job.get("precise_cuts", False),
                         )
 
                     # Queued jobs auto-save (no per-job dialog) so the whole
@@ -2237,10 +2933,10 @@ class VideoClipperApp:
 
                     saved_paths.append(dest)
                     self.log(f"Saved: {dest}")
-                    self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "\u2705 Done"))
+                    self.root.after(0, lambda i=job_id: self._set_queue_row_status(i, "\u2705 Done"))
                 except Exception as e:
                     self.log(f"ERROR in queued job '{job['source_display']}': {e}")
-                    self.root.after(0, lambda i=item_id: self.queue_tree.set(i, "status", "\u274c Failed"))
+                    self.root.after(0, lambda i=job_id: self._set_queue_row_status(i, "\u274c Failed"))
                 finally:
                     shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -2250,7 +2946,6 @@ class VideoClipperApp:
             self.root.after(0, lambda: self.run_queue_button.configure(state="normal"))
             self.root.after(0, lambda: self.set_running(False))
             if saved_paths:
-                summary = "\n".join(os.path.basename(p) for p in saved_paths)
                 self.root.after(0, lambda: self._show_success(os.path.dirname(saved_paths[0])))
 
         threading.Thread(target=worker, daemon=True).start()
