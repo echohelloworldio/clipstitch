@@ -827,6 +827,139 @@ def apply_post_filters(clip_path, vf, af, log, on_progress=None):
 
 
 # ----------------------------------------------------------------------
+# Silence / dead-air auto-trim
+# ----------------------------------------------------------------------
+
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)")
+
+
+def _has_audio_stream(input_path):
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", input_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return bool(result.stdout.strip())
+
+
+def detect_silence_ranges(input_path, silence_thresh_db=-30, min_silence_duration=0.5):
+    """Runs ffmpeg's silencedetect filter (a full decode pass, no output
+    file - just analysis) and parses the silence_start/silence_end
+    markers it writes to stderr. Returns a list of (start, end) tuples
+    in seconds, one per detected silent stretch at least
+    min_silence_duration long and quieter than silence_thresh_db."""
+    cmd = [
+        FFMPEG_BIN, "-i", input_path,
+        "-af", f"silencedetect=noise={silence_thresh_db}dB:d={min_silence_duration}",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    ranges = []
+    pending_start = None
+    for line in result.stderr.splitlines():
+        m_start = _SILENCE_START_RE.search(line)
+        if m_start:
+            pending_start = float(m_start.group(1))
+            continue
+        m_end = _SILENCE_END_RE.search(line)
+        if m_end and pending_start is not None:
+            ranges.append((pending_start, float(m_end.group(1))))
+            pending_start = None
+    return ranges
+
+
+def compute_keep_segments(duration, silence_ranges, padding=0.15, min_keep_duration=0.2):
+    """Turns detected silent ranges into the complementary list of
+    (start, end) segments to KEEP - i.e. the video with dead air cut
+    out. `padding` pulls each silence range in a bit on both ends so a
+    cut doesn't clip the tail/lead-in of actual speech right next to
+    it. Keep-segments that end up shorter than min_keep_duration after
+    padding are dropped (typically just a breath between two silences,
+    not real content)."""
+    if not silence_ranges:
+        return [(0.0, duration)]
+
+    padded = []
+    for s, e in sorted(silence_ranges):
+        s2, e2 = s + padding, e - padding
+        if e2 > s2:
+            padded.append((s2, e2))
+
+    keep = []
+    cursor = 0.0
+    for s, e in padded:
+        if s > cursor:
+            keep.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < duration:
+        keep.append((cursor, duration))
+
+    keep = [(s, e) for s, e in keep if e - s >= min_keep_duration]
+    return keep or [(0.0, duration)]
+
+
+def _apply_silence_trim_if_needed(final_path, work_dir, export_options, log, progress,
+                                   stage_base, stage_span):
+    """Detects and removes dead air from the finished joined video in
+    place. Runs right after joining and BEFORE captions, since removing
+    silence shifts the timeline - burning captions in first would leave
+    them desynced against the trimmed result."""
+    if not export_options.get("auto_trim_silence"):
+        progress(stage_base + stage_span)
+        return
+
+    if not _has_audio_stream(final_path):
+        log("  Auto-trim silence: no audio track found - skipping.")
+        progress(stage_base + stage_span)
+        return
+
+    thresh = export_options.get("silence_threshold_db", -30)
+    min_dur = export_options.get("silence_min_duration", 0.5)
+    padding = export_options.get("silence_padding", 0.15)
+
+    log(f"Scanning for silence (threshold {thresh}dB, min duration {min_dur}s)...")
+    duration = get_video_duration(final_path) or 0.0
+    silence_ranges = detect_silence_ranges(final_path, thresh, min_dur)
+    keep_segments = compute_keep_segments(duration, silence_ranges, padding)
+
+    if not silence_ranges or (len(keep_segments) == 1 and keep_segments[0] == (0.0, duration)):
+        log("  No silent sections found above the threshold.")
+        progress(stage_base + stage_span)
+        return
+
+    removed = duration - sum(e - s for s, e in keep_segments)
+    log(f"  Found {len(silence_ranges)} silent section(s) - removing about "
+        f"{removed:.1f}s, keeping {len(keep_segments)} piece(s).")
+
+    trim_dir = os.path.join(work_dir, "_trim_parts")
+    os.makedirs(trim_dir, exist_ok=True)
+    part_paths = []
+    total_keep_dur = sum(e - s for s, e in keep_segments) or 1.0
+    cum = 0.0
+    for i, (s, e) in enumerate(keep_segments):
+        seg_weight = (e - s) / total_keep_dur
+        base = cum
+
+        def on_p(frac, base=base, seg_weight=seg_weight):
+            progress(stage_base + stage_span * (base + seg_weight * frac))
+
+        part_path = os.path.join(trim_dir, f"part_{i:03d}.mp4")
+        # Silence boundaries won't land on keyframes, so this needs a
+        # real re-encode (same as "frame-accurate cuts") to avoid
+        # garbage frames or A/V drift at each new cut point.
+        cut_clip(final_path, s, e, part_path, reencode=True, on_progress=on_p)
+        part_paths.append(part_path)
+        cum += seg_weight
+
+    trimmed_path = os.path.join(work_dir, "output_trimmed.mp4")
+    _finish_join(part_paths, trimmed_path, trim_dir, log)
+    os.replace(trimmed_path, final_path)
+    progress(stage_base + stage_span)
+
+
+# ----------------------------------------------------------------------
 # Burned-in captions: either an existing .srt file, or a lightweight
 # manually-timed script (reusing the app's START,END,... line format).
 # ----------------------------------------------------------------------
@@ -1213,14 +1346,16 @@ def run_pipeline_from_file(input_path, segments, reencode, log, progress, work_d
 
     needs_filter_pass = bool(export_options.get("aspect_preset_filter") or export_options.get("normalize_audio"))
     needs_captions = export_options.get("captions_mode") in ("srt", "manual")
+    needs_trim = bool(export_options.get("auto_trim_silence"))
     crossfade_d = export_options.get("crossfade_duration") or 0
     use_crossfade = crossfade_d > 0 and len(segments) > 1
 
     segments_share = 0.55
     filter_share = 0.15 if needs_filter_pass else 0.0
     join_share = 0.20 if use_crossfade else 0.05
+    trim_share = 0.20 if needs_trim else 0.0
     captions_share = 0.15 if needs_captions else 0.0
-    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - captions_share)
+    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - trim_share - captions_share)
 
     total_dur = sum(max(end - start, 0.001) for start, end in segments) or 1.0
     clip_paths = []
@@ -1266,7 +1401,11 @@ def run_pipeline_from_file(input_path, segments, reencode, log, progress, work_d
         _finish_join(clip_paths, final_path, clips_dir, log)
         progress(join_base + join_share)
 
-    captions_base = join_base + join_share
+    trim_base = join_base + join_share
+    _apply_silence_trim_if_needed(final_path, work_dir, export_options, log, progress,
+                                   trim_base, trim_share)
+
+    captions_base = trim_base + trim_share
     _apply_captions_if_needed(final_path, work_dir, export_options, log, progress,
                                captions_base, captions_share)
 
@@ -1307,14 +1446,16 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
 
     needs_filter_pass = bool(export_options.get("aspect_preset_filter") or export_options.get("normalize_audio"))
     needs_captions = export_options.get("captions_mode") in ("srt", "manual")
+    needs_trim = bool(export_options.get("auto_trim_silence"))
     crossfade_d = export_options.get("crossfade_duration") or 0
     use_crossfade = crossfade_d > 0 and len(segments) > 1
 
     segments_share = 0.55
     filter_share = 0.15 if needs_filter_pass else 0.0
     join_share = 0.20 if use_crossfade else 0.05
+    trim_share = 0.20 if needs_trim else 0.0
     captions_share = 0.15 if needs_captions else 0.0
-    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - captions_share)
+    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - trim_share - captions_share)
 
     total_dur = sum(max(end - start, 0.001) for start, end in segments) or 1.0
     clip_paths = []
@@ -1368,7 +1509,11 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
         _finish_join(clip_paths, final_path, clips_dir, log)
         progress(join_base + join_share)
 
-    captions_base = join_base + join_share
+    trim_base = join_base + join_share
+    _apply_silence_trim_if_needed(final_path, work_dir, export_options, log, progress,
+                                   trim_base, trim_share)
+
+    captions_base = trim_base + trim_share
     _apply_captions_if_needed(final_path, work_dir, export_options, log, progress,
                                captions_base, captions_share)
 
@@ -1551,6 +1696,10 @@ class VideoClipperApp:
         self.caption_font_size_var = tk.StringVar(value="28")
         self.caption_color_var = tk.StringVar(value="White")
         self.caption_position_var = tk.StringVar(value="Bottom")
+        self.auto_trim_var = tk.BooleanVar(value=False)
+        self.silence_threshold_var = tk.StringVar(value="-30")
+        self.silence_min_duration_var = tk.StringVar(value="0.5")
+        self.silence_padding_var = tk.StringVar(value="0.15")
 
         self.is_running = False
         self._pending_final_path = None
@@ -2008,6 +2157,44 @@ class VideoClipperApp:
         _muted_label(parent, "Only applies when there are 2+ clips; forces a re-encode."
                      ).pack(anchor="w", padx=16, pady=(0, 10))
 
+        trim_sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
+        trim_sep.pack(fill="x", padx=16, pady=6)
+
+        # --- Silence / dead-air auto-trim ---
+        row = _row(parent)
+        row.pack(fill="x", **pad)
+        ctk.CTkCheckBox(row, text="Remove silent/dead-air sections", variable=self.auto_trim_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER).pack(side="left")
+
+        trim_row = _row(parent)
+        trim_row.pack(fill="x", **pad)
+        ctk.CTkLabel(trim_row, text="Threshold:", font=_f(12), text_color=TEXT).pack(side="left")
+        ctk.CTkEntry(trim_row, textvariable=self.silence_threshold_var, width=56, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(6, 4))
+        ctk.CTkLabel(trim_row, text="dB", font=_f(12), text_color=TEXT_MUTED
+                     ).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(trim_row, text="Min length:", font=_f(12), text_color=TEXT).pack(side="left")
+        ctk.CTkEntry(trim_row, textvariable=self.silence_min_duration_var, width=50, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(6, 4))
+        ctk.CTkLabel(trim_row, text="s", font=_f(12), text_color=TEXT_MUTED
+                     ).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(trim_row, text="Padding:", font=_f(12), text_color=TEXT).pack(side="left")
+        ctk.CTkEntry(trim_row, textvariable=self.silence_padding_var, width=50, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(6, 4))
+        ctk.CTkLabel(trim_row, text="s", font=_f(12), text_color=TEXT_MUTED).pack(side="left")
+
+        _muted_label(
+            parent, "Cuts out stretches quieter than Threshold and longer than Min "
+                    "length. Padding is kept around each cut so words don't get "
+                    "clipped. Forces a re-encode; runs before captions are burned "
+                    "in, so caption timings should be based on the trimmed result.",
+            wraplength=680, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
         cap_sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
         cap_sep.pack(fill="x", padx=16, pady=6)
 
@@ -2156,6 +2343,24 @@ class VideoClipperApp:
         else:
             opts["gif_start"] = None
             opts["gif_duration"] = 3.0
+
+        opts["auto_trim_silence"] = self.auto_trim_var.get()
+        if opts["auto_trim_silence"]:
+            try:
+                opts["silence_threshold_db"] = float(self.silence_threshold_var.get())
+            except ValueError:
+                raise ValueError("Silence threshold must be a number (dB), e.g. -30.")
+            try:
+                min_dur = float(self.silence_min_duration_var.get())
+                if min_dur <= 0:
+                    raise ValueError
+                opts["silence_min_duration"] = min_dur
+            except ValueError:
+                raise ValueError("Silence min length must be a positive number of seconds.")
+            try:
+                opts["silence_padding"] = float(self.silence_padding_var.get())
+            except ValueError:
+                raise ValueError("Silence padding must be a number of seconds, e.g. 0.15.")
 
         opts["captions_mode"] = None
         opts["captions_srt_path"] = None

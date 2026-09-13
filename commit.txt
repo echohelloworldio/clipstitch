@@ -1,31 +1,57 @@
-feat: add export presets, crossfade, batch queue, and side-exports
+Redesign UI with CustomTkinter, add preview/captions/silence-trim, fix progress+build bugs
 
-Adds the "Tier 1" content-creator features to ClipStitch:
+UI
+- Migrate from ttk to CustomTkinter: dark theme, card layout, segmented
+  file/URL toggle, custom batch-queue list (replaces ttk.Treeview),
+  CTkProgressBar. Drag-and-drop preserved via a TkinterDnD.Tk + ctk.CTk
+  mixin root class.
+- Add live URL link preview: debounced (700ms) background fetch shows
+  thumbnail, title, uploader, and duration under the URL field as the
+  user pastes/types. Session-cached by URL.
+- Add local-file scrub/preview player: fast keyframe-seek frame grabs
+  (extract_preview_frame_bytes), a scrubber slider, Play/Pause,
+  +/-1s/5s step buttons, and Set In / Set Out / Add Clip to append a
+  START,END line straight into the Timestamps box. URL mode shows an
+  explanatory placeholder instead, since section-only downloads have
+  nothing to scrub yet.
 
-- Aspect ratio / platform presets (TikTok/Shorts 9:16, YouTube 16:9,
-  Instagram Square 1:1) via a scale+crop filter that adapts to any
-  source aspect ratio.
-- Audio loudness normalization (single-pass loudnorm) so joined
-  clips don't jump between loud and quiet.
-- Crossfade transitions between clips (configurable duration) as an
-  alternative to a hard cut, with automatic fallback to a plain join
-  if clips are too short or too numerous for a clean transition.
-- Side-exports generated alongside the main clip: WebM (VP9/Opus),
-  MP3 audio-only, a JPG thumbnail, and a GIF - each at a
-  user-chosen timestamp within the final clip.
-- A batch queue: add multiple jobs (local file or URL, each with its
-  own timestamps and export settings) and run them all unattended,
-  with per-job status shown in a queue list and auto-save to a
-  default output folder.
+New export features (Tier 2)
+- Burned-in captions: from an existing .srt file, or a manual script
+  reusing the app's START,END,TEXT line format
+  (parse_simple_captions_script -> write_srt_file). Style controls for
+  font size/color/position. Burned in via ffmpeg's subtitles+
+  force_style filter after the join step, so timings match the final
+  clip and any thumbnail/GIF taken afterward shows the captions too.
+- Silence/dead-air auto-trim: detects quiet stretches via ffmpeg's
+  silencedetect (detect_silence_ranges), computes the complementary
+  keep-segments with a configurable padding buffer
+  (compute_keep_segments), then re-cuts and rejoins the video with the
+  silence removed. User-configurable threshold (dB), minimum silence
+  length, and padding. Runs after joining but before captions, since
+  trimming shifts the timeline.
 
-Also:
-- Progress bar math now accounts for the extra encode passes (filters,
-  crossfade, side-exports) so it still advances smoothly and
-  proportionally instead of stalling during the new stages.
-- Refactored per-clip post-processing into apply_post_filters() and
-  extracted a shared _run_ffmpeg_with_progress() helper used by every
-  re-encoding step (filters, crossfade, WebM export) for consistent
-  live progress reporting.
+Bug fixes
+- Progress bar could visibly regress: yt-dlp reuses the same progress
+  hook for the video and audio streams of a bestvideo+bestaudio
+  download, so raw per-stream fractions reset to 0 mid-download.
+  _make_progress_hook now tracks combined multi-phase progress via
+  info_dict's requested_formats, so overall progress is monotonic.
+- yt-dlp's post-download merge/remux/fixup steps reported zero
+  progress AND were silently dropped by the log filter
+  (_YtDlpLogger.debug only forwarded "[download]"/"Destination"
+  lines). Now also surfaces [Merger]/[ffmpeg]/[Fixup]/etc. lines, and
+  the GUI's ETA label falls back to "still working (Ns, no % available)"
+  after a stall instead of freezing on a stale ETA.
+- Added a monotonic clamp in the GUI's set_progress so the bar can
+  never visibly move backward regardless of cause.
+- "Top" caption position initially rendered middle-left: this
+  ffmpeg/libass build uses legacy SSA alignment codes (6=top-center)
+  rather than the ASS-v4 numpad scheme (8=top-center) assumed at
+  first. Found by rendering both and comparing actual frames.
 
-No breaking changes to existing local-file or URL clipping workflows;
-all new options are opt-in and collapsed by default in the UI.
+Build
+- build_exe.bat: PyInstaller wasn't bundling Pillow despite it being a
+  hard dependency of customtkinter (ModuleNotFoundError: No module
+  named 'PIL' on the built .exe). Fixed by installing Pillow
+  explicitly and adding --collect-all PIL alongside the existing
+  --collect-all customtkinter/tkinterdnd2 flags.
