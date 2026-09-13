@@ -826,6 +826,184 @@ def apply_post_filters(clip_path, vf, af, log, on_progress=None):
     os.replace(tmp_path, clip_path)
 
 
+# ----------------------------------------------------------------------
+# Burned-in captions: either an existing .srt file, or a lightweight
+# manually-timed script (reusing the app's START,END,... line format).
+# ----------------------------------------------------------------------
+
+CAPTION_COLORS = {
+    # ASS/libass colours are &HAABBGGRR (alpha, then blue-green-red) -
+    # opposite byte order from the RGB hex people normally think in.
+    "White": "&H00FFFFFF",
+    "Yellow": "&H0000FFFF",
+    "Black": "&H00000000",
+    "Red": "&H000000FF",
+    "Cyan": "&H00FFFF00",
+}
+
+CAPTION_POSITIONS = {
+    # These are libass/SSA alignment codes. Empirically confirmed against
+    # this project's ffmpeg build: it honors the legacy SSA numbering
+    # (2=bottom-center, 6=top-center) rather than the newer ASS-v4+
+    # numpad scheme (where 8 is top-center) - using 8 here silently
+    # rendered as middle-left instead. Verified by rendering both and
+    # comparing actual frames, not assumed from the spec.
+    "Bottom": 2,
+    "Top": 6,
+}
+
+
+def _srt_timestamp(total_seconds):
+    """SRT's timestamp format - same idea as seconds_to_timestamp, but
+    SRT requires a comma before the milliseconds instead of a period."""
+    total_seconds = max(0.0, total_seconds)
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    seconds = int(total_seconds % 60)
+    millis = int(round((total_seconds - int(total_seconds)) * 1000))
+    if millis == 1000:
+        millis = 0
+        seconds += 1
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def parse_simple_captions_script(text):
+    """Parses the lightweight manual-captions format: one caption per
+    line, START,END,TEXT (same START,END style as the Timestamps box,
+    with a third comma-separated field for the caption text itself).
+    Blank lines are skipped. Returns a list of (start, end, text)
+    tuples in seconds. Raises ValueError with a line-specific message
+    on anything malformed, same pattern as parse_timestamps_text."""
+    entries = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(",", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                f"Line {line_no}: expected START,END,TEXT (e.g. "
+                f"'00:00:01,00:00:04,Hello world'), got: '{line}'"
+            )
+        start_str, end_str, caption_text = parts
+        try:
+            start = parse_time(start_str)
+            end = parse_time(end_str)
+        except ValueError as e:
+            raise ValueError(f"Line {line_no}: {e}")
+        caption_text = caption_text.strip()
+        if not caption_text:
+            raise ValueError(f"Line {line_no}: caption text is empty.")
+        if end <= start:
+            raise ValueError(f"Line {line_no}: end must come after start.")
+        entries.append((start, end, caption_text))
+
+    if not entries:
+        raise ValueError("No caption lines found.")
+    return entries
+
+
+def write_srt_file(entries, srt_path):
+    """Writes (start, end, text) tuples (seconds) out as a standard .srt
+    file. `text` may itself contain literal '\\n' to force a line break
+    within one caption."""
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(entries, start=1):
+            f.write(f"{i}\n")
+            f.write(f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n")
+            f.write(text.replace("\\n", "\n") + "\n\n")
+
+
+def _escape_ffmpeg_subtitles_path(path):
+    """ffmpeg's subtitles filter takes its file argument as part of a
+    filtergraph string, which treats ':' and other characters
+    specially - most notoriously breaking on a Windows drive letter
+    (C:\\...) unless it's escaped. Converts backslashes to forward
+    slashes and escapes ':' so 'C:\\Users\\x.srt' becomes the
+    filter-safe 'C\\:/Users/x.srt'."""
+    posix_path = path.replace("\\", "/")
+    return posix_path.replace(":", r"\:")
+
+
+def burn_in_captions(input_path, srt_path, out_path, log, on_progress=None,
+                      font_size=28, font_color="White", position="Bottom"):
+    """Hard-codes (burns in) subtitles from an .srt file into the video -
+    unlike a soft-subtitle track, these become part of the picture
+    itself and show up on every player, which is the point for
+    short-form/social clips. Requires a full re-encode (can't be done
+    with stream copy) since it's literally drawing onto the frames."""
+    duration = get_video_duration(input_path) or 0
+    color_hex = CAPTION_COLORS.get(font_color, CAPTION_COLORS["White"])
+    alignment = CAPTION_POSITIONS.get(position, CAPTION_POSITIONS["Bottom"])
+    style = (
+        f"FontSize={font_size},PrimaryColour={color_hex},"
+        f"OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,"
+        f"Alignment={alignment},MarginV=30"
+    )
+    escaped_srt = _escape_ffmpeg_subtitles_path(srt_path)
+    vf = f"subtitles='{escaped_srt}':force_style='{style}'"
+
+    cmd = [
+        FFMPEG_BIN, "-y", "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "copy",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        out_path,
+    ]
+    _run_ffmpeg_with_progress(cmd, duration, log, "burning in captions", on_progress)
+
+
+def _resolve_captions_srt_path(export_options, work_dir, log):
+    """Turns whichever caption source the user picked (an existing .srt
+    file, or a manually-typed script already parsed into entries) into
+    a concrete .srt path ready for burn_in_captions. Returns None if
+    captions weren't requested or there's nothing usable."""
+    mode = export_options.get("captions_mode")
+    if mode == "srt":
+        srt_path = export_options.get("captions_srt_path")
+        if srt_path and os.path.isfile(srt_path):
+            return srt_path
+        log("  Captions: no valid .srt file was provided - skipping.")
+        return None
+    if mode == "manual":
+        entries = export_options.get("captions_entries")
+        if not entries:
+            return None
+        srt_path = os.path.join(work_dir, "_captions.srt")
+        write_srt_file(entries, srt_path)
+        return srt_path
+    return None
+
+
+def _apply_captions_if_needed(final_path, work_dir, export_options, log, progress,
+                               stage_base, stage_span):
+    """Burns captions into the finished joined video in place, if
+    requested. Runs after joining (so caption timings are relative to
+    the FINAL video's timeline, matching how thumbnail/GIF timestamps
+    already work) and before side-exports (so a thumbnail/GIF taken
+    afterward shows the captions too)."""
+    srt_path = _resolve_captions_srt_path(export_options, work_dir, log)
+    if not srt_path:
+        progress(stage_base + stage_span)
+        return
+
+    log("Burning in captions...")
+    captioned_path = os.path.join(work_dir, "output_captioned.mp4")
+
+    def on_p(frac):
+        progress(stage_base + stage_span * frac)
+
+    burn_in_captions(
+        final_path, srt_path, captioned_path, log, on_progress=on_p,
+        font_size=export_options.get("caption_font_size", 28),
+        font_color=export_options.get("caption_color", "White"),
+        position=export_options.get("caption_position", "Bottom"),
+    )
+    os.replace(captioned_path, final_path)
+    progress(stage_base + stage_span)
+
+
 def crossfade_join(clip_paths, output_path, transition_duration, log, on_progress=None):
     """Joins clips with a video crossfade + audio crossfade between each
     consecutive pair, instead of a hard cut. Requires re-encoding (can't
@@ -1034,13 +1212,15 @@ def run_pipeline_from_file(input_path, segments, reencode, log, progress, work_d
     os.makedirs(clips_dir, exist_ok=True)
 
     needs_filter_pass = bool(export_options.get("aspect_preset_filter") or export_options.get("normalize_audio"))
+    needs_captions = export_options.get("captions_mode") in ("srt", "manual")
     crossfade_d = export_options.get("crossfade_duration") or 0
     use_crossfade = crossfade_d > 0 and len(segments) > 1
 
     segments_share = 0.55
     filter_share = 0.15 if needs_filter_pass else 0.0
     join_share = 0.20 if use_crossfade else 0.05
-    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share)
+    captions_share = 0.15 if needs_captions else 0.0
+    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - captions_share)
 
     total_dur = sum(max(end - start, 0.001) for start, end in segments) or 1.0
     clip_paths = []
@@ -1086,8 +1266,12 @@ def run_pipeline_from_file(input_path, segments, reencode, log, progress, work_d
         _finish_join(clip_paths, final_path, clips_dir, log)
         progress(join_base + join_share)
 
+    captions_base = join_base + join_share
+    _apply_captions_if_needed(final_path, work_dir, export_options, log, progress,
+                               captions_base, captions_share)
+
     _apply_export_extras(final_path, work_dir, export_options, log, progress,
-                          join_base + join_share, extras_share)
+                          captions_base + captions_share, extras_share)
     progress(1.0)
 
     if not keep_clips:
@@ -1122,13 +1306,15 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
     os.makedirs(clips_dir, exist_ok=True)
 
     needs_filter_pass = bool(export_options.get("aspect_preset_filter") or export_options.get("normalize_audio"))
+    needs_captions = export_options.get("captions_mode") in ("srt", "manual")
     crossfade_d = export_options.get("crossfade_duration") or 0
     use_crossfade = crossfade_d > 0 and len(segments) > 1
 
     segments_share = 0.55
     filter_share = 0.15 if needs_filter_pass else 0.0
     join_share = 0.20 if use_crossfade else 0.05
-    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share)
+    captions_share = 0.15 if needs_captions else 0.0
+    extras_share = max(0.0, 1.0 - segments_share - filter_share - join_share - captions_share)
 
     total_dur = sum(max(end - start, 0.001) for start, end in segments) or 1.0
     clip_paths = []
@@ -1182,8 +1368,12 @@ def run_pipeline_from_url(url, segments, log, progress, work_dir,
         _finish_join(clip_paths, final_path, clips_dir, log)
         progress(join_base + join_share)
 
+    captions_base = join_base + join_share
+    _apply_captions_if_needed(final_path, work_dir, export_options, log, progress,
+                               captions_base, captions_share)
+
     _apply_export_extras(final_path, work_dir, export_options, log, progress,
-                          join_base + join_share, extras_share)
+                          captions_base + captions_share, extras_share)
     progress(1.0)
 
     if not keep_clips:
@@ -1355,6 +1545,12 @@ class VideoClipperApp:
         self.gif_var = tk.BooleanVar(value=False)
         self.gif_start_var = tk.StringVar(value="0:00")
         self.gif_duration_var = tk.StringVar(value="3")
+        self.captions_enabled_var = tk.BooleanVar(value=False)
+        self.captions_mode_var = tk.StringVar(value="SRT file")
+        self.captions_srt_path_var = tk.StringVar(value="")
+        self.caption_font_size_var = tk.StringVar(value="28")
+        self.caption_color_var = tk.StringVar(value="White")
+        self.caption_position_var = tk.StringVar(value="Bottom")
 
         self.is_running = False
         self._pending_final_path = None
@@ -1812,6 +2008,77 @@ class VideoClipperApp:
         _muted_label(parent, "Only applies when there are 2+ clips; forces a re-encode."
                      ).pack(anchor="w", padx=16, pady=(0, 10))
 
+        cap_sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
+        cap_sep.pack(fill="x", padx=16, pady=6)
+
+        # --- Burned-in captions ---
+        row = _row(parent)
+        row.pack(fill="x", **pad)
+        ctk.CTkCheckBox(row, text="Burn in captions", variable=self.captions_enabled_var,
+                         font=_f(12), text_color=TEXT, fg_color=ACCENT,
+                         hover_color=ACCENT_HOVER, border_color=BORDER).pack(side="left")
+        self.captions_mode_toggle = ctk.CTkSegmentedButton(
+            row, values=["SRT file", "Manual script"], font=_f(11), height=26,
+            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+            unselected_color=BG_ELEVATED, unselected_hover_color=CARD_BG_HOVER,
+            fg_color=BG_ELEVATED, text_color=TEXT, corner_radius=7,
+            variable=self.captions_mode_var, command=self._on_captions_mode_toggle,
+        )
+        self.captions_mode_toggle.pack(side="left", padx=(14, 0))
+
+        self.captions_srt_row = _row(parent)
+        self.captions_srt_row.pack(fill="x", **pad)
+        ctk.CTkEntry(self.captions_srt_row, textvariable=self.captions_srt_path_var, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT,
+                     placeholder_text="Path to an .srt file...",
+                     ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        _secondary_button(self.captions_srt_row, "Browse", self._browse_captions_srt,
+                           height=28).pack(side="left")
+
+        self.captions_manual_row = _row(parent)
+        # not packed yet - shown only when "Manual script" is selected
+        manual_card = ctk.CTkFrame(self.captions_manual_row, fg_color=BG_ELEVATED,
+                                    corner_radius=8, border_width=1, border_color=BORDER)
+        manual_card.pack(fill="x")
+        self.captions_manual_box = ctk.CTkTextbox(
+            manual_card, height=80, wrap="none", fg_color=BG_ELEVATED, text_color=TEXT_MUTED,
+            font=_mono(11), corner_radius=8, border_width=0,
+        )
+        self.captions_manual_box.pack(fill="both", expand=True, padx=2, pady=2)
+        self._captions_manual_placeholder = (
+            "00:00:01,00:00:04,Your first caption\n00:00:05,00:00:08,Your second caption"
+        )
+        self._show_captions_manual_placeholder()
+        self.captions_manual_box.bind("<FocusIn>", self._clear_captions_manual_placeholder)
+
+        _muted_label(
+            parent, "Manual script format: one caption per line, START,END,TEXT "
+                    "(same style as Timestamps above). Timings are relative to the "
+                    "FINAL joined clip.",
+        ).pack(anchor="w", padx=16, pady=(4, 8))
+
+        style_row = _row(parent)
+        style_row.pack(fill="x", **pad)
+        ctk.CTkLabel(style_row, text="Font size:", font=_f(12), text_color=TEXT
+                     ).pack(side="left")
+        ctk.CTkEntry(style_row, textvariable=self.caption_font_size_var, width=50, height=28,
+                     fg_color=BG_ELEVATED, border_color=BORDER, text_color=TEXT
+                     ).pack(side="left", padx=(6, 16))
+        ctk.CTkLabel(style_row, text="Color:", font=_f(12), text_color=TEXT
+                     ).pack(side="left")
+        ctk.CTkComboBox(style_row, variable=self.caption_color_var, state="readonly", width=110,
+                         fg_color=BG_ELEVATED, border_color=BORDER, button_color=BORDER,
+                         button_hover_color=ACCENT, text_color=TEXT, dropdown_fg_color=CARD_BG,
+                         values=list(CAPTION_COLORS.keys())).pack(side="left", padx=(6, 16))
+        ctk.CTkLabel(style_row, text="Position:", font=_f(12), text_color=TEXT
+                     ).pack(side="left")
+        ctk.CTkComboBox(style_row, variable=self.caption_position_var, state="readonly", width=110,
+                         fg_color=BG_ELEVATED, border_color=BORDER, button_color=BORDER,
+                         button_hover_color=ACCENT, text_color=TEXT, dropdown_fg_color=CARD_BG,
+                         values=list(CAPTION_POSITIONS.keys())).pack(side="left", padx=(6, 0))
+
+        self._on_captions_mode_toggle(self.captions_mode_var.get())
+
         sep = ctk.CTkFrame(parent, fg_color=BORDER, height=1)
         sep.pack(fill="x", padx=16, pady=6)
 
@@ -1889,6 +2156,35 @@ class VideoClipperApp:
         else:
             opts["gif_start"] = None
             opts["gif_duration"] = 3.0
+
+        opts["captions_mode"] = None
+        opts["captions_srt_path"] = None
+        opts["captions_entries"] = None
+        if self.captions_enabled_var.get():
+            if self.captions_mode_var.get() == "SRT file":
+                srt_path = self.captions_srt_path_var.get().strip()
+                if not srt_path:
+                    raise ValueError("Choose an .srt file, or switch to Manual script.")
+                if not os.path.isfile(srt_path):
+                    raise ValueError(f"Couldn't find the .srt file:\n{srt_path}")
+                opts["captions_mode"] = "srt"
+                opts["captions_srt_path"] = srt_path
+            else:
+                script_text = self._get_captions_manual_text()
+                if not script_text.strip():
+                    raise ValueError("Type at least one caption line, or switch to SRT file.")
+                try:
+                    opts["captions_entries"] = parse_simple_captions_script(script_text)
+                except ValueError as e:
+                    raise ValueError(f"Invalid captions script: {e}")
+                opts["captions_mode"] = "manual"
+
+            try:
+                opts["caption_font_size"] = int(self.caption_font_size_var.get())
+            except ValueError:
+                raise ValueError("Caption font size must be a whole number.")
+            opts["caption_color"] = self.caption_color_var.get()
+            opts["caption_position"] = self.caption_position_var.get()
 
         return opts
 
@@ -2276,6 +2572,39 @@ class VideoClipperApp:
         if getattr(self, "_placeholder_active", False):
             return ""
         return self.timestamps_box.get("1.0", "end")
+
+    def _show_captions_manual_placeholder(self):
+        self.captions_manual_box.delete("1.0", "end")
+        self.captions_manual_box.insert("1.0", self._captions_manual_placeholder)
+        self.captions_manual_box.configure(text_color=TEXT_FAINT)
+        self._captions_manual_placeholder_active = True
+
+    def _clear_captions_manual_placeholder(self, event=None):
+        if getattr(self, "_captions_manual_placeholder_active", False):
+            self.captions_manual_box.delete("1.0", "end")
+            self.captions_manual_box.configure(text_color=TEXT)
+            self._captions_manual_placeholder_active = False
+
+    def _get_captions_manual_text(self):
+        if getattr(self, "_captions_manual_placeholder_active", False):
+            return ""
+        return self.captions_manual_box.get("1.0", "end")
+
+    def _on_captions_mode_toggle(self, value):
+        if value == "SRT file":
+            self.captions_manual_row.pack_forget()
+            self.captions_srt_row.pack(fill="x", padx=16, pady=6, after=self.captions_mode_toggle.master)
+        else:
+            self.captions_srt_row.pack_forget()
+            self.captions_manual_row.pack(fill="x", padx=16, pady=6, after=self.captions_mode_toggle.master)
+
+    def _browse_captions_srt(self):
+        path = filedialog.askopenfilename(
+            title="Select .srt subtitle file",
+            filetypes=[("SubRip subtitles", "*.srt"), ("All files", "*.*")],
+        )
+        if path:
+            self.captions_srt_path_var.set(path)
 
     # ------------------------------------------------------------------
     # File pickers
